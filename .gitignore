@@ -1,0 +1,29 @@
+# 本地密钥与运行环境
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# 训练输入、模型权重、导出结果和临时数据
+data/
+*.zip
+*.ply
+*.splat
+*.pt
+*.pth
+
+# 前端依赖和构建产物
+frontend/node_modules/
+frontend/dist/
+
+# 独立维护的外部源码仓库
+FlexGaussian/
+
+# 本地编辑器和系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,93 +1,308 @@
-# GaussianSplattingSystem
+# 3DGS 训练服务
 
+基于 FlexGaussian 的 3D Gaussian Splatting 训练服务，支持多视角照片和视频输入，提供完整的 Web 管理界面。
 
+---
 
-## Getting started
+## 🚀 快速开始
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+### 访问地址
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+- **前端管理界面**: http://192.168.10.148:3002
+- **后端 API**: http://192.168.10.148:12524
+- **API 文档**: http://192.168.10.148:12524/docs
 
-## Add your files
+### 启动服务
 
-* [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+```bash
+# 启动后端（Docker）
+cd /home/3dgs
+cp .env.example .env  # 首次部署时填写实际 API_KEY 和 Redis 地址
+docker-compose up -d
+
+# 启动前端
+cd /home/3dgs/frontend
+npm install
+npm run dev -- --host 0.0.0.0 --port 3002
+```
+
+---
+
+## ✨ 核心功能
+
+### 1. 多视角照片训练
+- 支持 ZIP 压缩包上传（包含多角度拍摄的图像序列）
+- 自动 COLMAP/MASt3R 特征提取和相机位姿估计
+- 灵活的训练参数配置（迭代次数、分辨率、场景类型）
+- 实时训练进度和日志显示
+
+### 2. 视频自动抽帧
+- 支持格式：MP4、AVI、MOV、MKV、WebM
+- 三种抽帧模式：
+  - **FPS 模式**：按帧率抽取（如每秒 5 帧）
+  - **时间间隔模式**：每隔 X 秒截取一帧（如 0.3 秒）
+  - **总帧数模式**：指定提取总帧数（如 100 帧）
+- 智能过滤：去除模糊帧和重复帧
+- 时间范围裁剪：指定视频的起止时间
+
+### 3. 模型压缩优化
+- 支持多种压缩算法：
+  - LightGaussian
+  - Mini-Splatting
+  - Compact3D
+- 可配置压缩级别（低/中/高）
+- 质量优先模式
+- 压缩前后对比（文件大小、PSNR）
+
+### 4. 去噪与质量优化
+- 不透明度过滤：移除低质量高斯点
+- 尺寸过滤：清理过小/过大的高斯点
+- 梯度裁剪：训练稳定性优化
+- 深度正则化：提升几何一致性
+- 抗锯齿：改善渲染质量
+
+### 5. Web 管理界面
+- 科技风格 UI（深色主题 + 霓虹蓝/紫配色）
+- 三大模块：生成、优化、查看
+- 实时进度显示和任务管理
+- 模型列表和详情查看
+
+---
+
+## 🏗️ 技术架构
+
+### 后端技术栈
+- **框架**: FastAPI 0.109.0
+- **任务队列**: Celery + Redis
+- **容器化**: Docker + docker-compose
+- **GPU 加速**: CUDA 12.8.1 + NVIDIA Container Toolkit
+
+### 前端技术栈
+- **框架**: Vue 3.4.0
+- **UI 组件**: Element Plus 2.5.0
+- **构建工具**: Vite 5.0.0
+- **状态管理**: Pinia 2.1.7
+- **路由**: Vue Router 4.2.5
+
+### 训练引擎
+- **3DGS 实现**: FlexGaussian（自适应参数、去噪优化）
+- **SfM 后端**:
+  - COLMAP（密集拍摄，20-500 张）
+  - MASt3R（少视角，2-15 张）
+- **视频处理**: FFmpeg
+
+---
+
+## 📁 项目结构
 
 ```
-cd existing_repo
-git remote add origin http://192.168.10.110:8929/jtyf/U3D/jtyf-gaussiansplattingsystem.git
-git branch -M main
-git push -uf origin main
+/home/3dgs/
+├── README.md                  # 本文档
+├── API使用手册.md              # 后端 API 详细文档
+├── 项目整合说明.md             # 前后端整合方案
+├── 视频训练设计分析.md         # 视频抽帧设计与优化建议
+│
+├── app/                       # 后端服务
+│   ├── main.py               # FastAPI 主应用
+│   ├── management_api.py     # 前端管理 API
+│   ├── pipeline.py           # 训练流程
+│   ├── trainer.py            # 训练器
+│   └── config.py             # 配置管理
+│
+├── frontend/                  # 前端管理界面
+│   ├── src/
+│   │   ├── views/            # 页面组件
+│   │   │   ├── Generate.vue  # 模型生成页面
+│   │   │   ├── Optimize.vue  # 压缩优化页面
+│   │   │   └── Viewer.vue    # 模型查看页面
+│   │   ├── api/              # API 封装
+│   │   └── router/           # 路由配置
+│   ├── 去噪优化指南.md
+│   ├── 视频抽帧指南.md
+│   └── 后端接口参考.md
+│
+├── FlexGaussian/             # 独立维护的外部源码仓库，不纳入本仓库
+├── data/                     # 数据存储目录
+│   ├── tasks/               # 训练任务数据
+│   ├── models/              # 生成的模型
+│   └── uploads/             # 上传文件
+│
+├── docs/                     # 文档目录
+│   ├── 核心设计/
+│   │   ├── 功能设计文档.md
+│   │   └── 动态3DGS实施方案.md
+│   ├── 升级规划/
+│   │   └── 后续升级规划.md
+│   └── 归档/
+│       ├── 已完成优化/
+│       ├── 阶段性实施/
+│       └── 实验性功能/
+│
+├── docker-compose.yml        # Docker 编排配置
+├── Dockerfile               # Docker 镜像构建
+├── .env.example              # 不含密钥的配置模板
+└── .env                      # 本地环境变量配置，不纳入 Git
 ```
 
-## Integrate with your tools
+---
 
-* [Set up project integrations](http://192.168.10.110:8929/jtyf/U3D/jtyf-gaussiansplattingsystem/-/settings/integrations)
+## 📖 文档导航
 
-## Collaborate with your team
+### 使用文档
+- [API 使用手册](./API使用手册.md) - 后端 API 完整参考
+- [视频抽帧指南](./frontend/视频抽帧指南.md) - 视频输入使用说明
+- [去噪优化指南](./frontend/去噪优化指南.md) - 质量优化参数说明
 
-* [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+### 设计文档
+- [功能设计文档](./docs/核心设计/功能设计文档.md) - 核心功能设计
+- [动态 3DGS 实施方案](./docs/核心设计/动态3DGS实施方案.md) - 完整实施方案
+- [视频训练设计分析](./视频训练设计分析.md) - 视频功能优化建议
 
-## Test and Deploy
+### 升级规划
+- [后续升级规划](./docs/升级规划/后续升级规划.md) - 功能路线图
+- [文档整理方案](./docs/文档整理方案.md) - 文档管理规范
 
-Use the built-in continuous integration in GitLab.
+---
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+## 🎯 典型使用流程
 
-***
+### 方式 1：照片训练
 
-# Editing this README
+1. 准备多角度拍摄的照片（建议 50-150 张）
+2. 打包为 ZIP 压缩包
+3. 访问前端界面，上传 ZIP 文件
+4. 配置训练参数（或使用推荐参数）
+5. 启动训练，实时查看进度
+6. 训练完成后下载或在线查看模型
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+### 方式 2：视频训练
 
-## Suggestions for a good README
+1. 录制环绕拍摄视频（建议 30-60 秒）
+2. 访问前端界面，上传视频文件
+3. 配置抽帧参数：
+   - 选择抽帧间隔（推荐 0.3-0.5 秒）
+   - 开启去模糊和去重
+4. 系统自动抽帧并开始训练
+5. 查看训练进度和最终模型
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+### 方式 3：API 调用
 
-## Name
-Choose a self-explaining name for your project.
+```bash
+# 提交训练任务
+curl -X POST http://192.168.10.148:12524/train \
+  -H "X-API-Key: your_key" \
+  -F "file=@photos.zip" \
+  -F "sfm_backend=colmap" \
+  -F "iterations=7000"
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+# 查询任务状态
+curl http://192.168.10.148:12524/task/{task_id}
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+# 下载结果
+curl -O http://192.168.10.148:12524/task/{task_id}/result
+```
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+---
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+## ⚙️ 配置说明
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+### 环境变量（.env）
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+```bash
+# API 密钥
+API_KEY=your_secret_key
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+# SfM 后端选择
+SFM_BACKEND=colmap  # 或 mast3r
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+# GPU 配置
+COLMAP_USE_GPU=1
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+# 训练参数
+MAX_ITERATIONS=30000
+MIN_IMAGES=10
+MAX_IMAGES=500
+```
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+### Docker 配置
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+- **API 端口**: 12524 (映射到容器内 8000)
+- **GPU 支持**: 需要 NVIDIA Container Toolkit
+- **数据挂载**: `/home/3dgs/data` → `/data`
 
-## License
-For open source projects, say how it is licensed.
+---
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+## 🔧 故障排查
+
+### 前端无法连接后端
+
+检查后端服务状态：
+```bash
+docker ps | grep 3dgs-api
+docker logs 3dgs-api
+```
+
+### 训练失败
+
+查看详细日志：
+```bash
+docker logs 3dgs-worker
+```
+
+常见问题：
+- 图片数量不足（需至少 10 张）
+- 图片质量差（模糊、曝光不足）
+- GPU 内存不足（尝试降低分辨率）
+
+### 视频抽帧失败
+
+检查 FFmpeg 是否可用：
+```bash
+docker exec 3dgs-api ffmpeg -version
+```
+
+---
+
+## 📊 性能指标
+
+### 训练时间（参考）
+
+| 场景类型 | 图片数量 | 分辨率 | 迭代次数 | 预计时间 |
+|---------|---------|--------|---------|---------|
+| 小物体 | 50 张 | 1/2 | 7000 | ~15 分钟 |
+| 室内场景 | 100 张 | 1/2 | 10000 | ~30 分钟 |
+| 室外场景 | 200 张 | 1/4 | 15000 | ~45 分钟 |
+
+*基于 NVIDIA RTX 3090 测试
+
+### 系统要求
+
+- **最低配置**:
+  - GPU: 8GB 显存（CUDA 11.8+）
+  - RAM: 16GB
+  - 磁盘: 50GB 可用空间
+
+- **推荐配置**:
+  - GPU: 24GB 显存（RTX 3090/4090）
+  - RAM: 32GB
+  - 磁盘: 100GB SSD
+
+---
+
+## 🤝 贡献与反馈
+
+如有问题或建议，请通过以下方式联系：
+
+- 查看 [API 使用手册](./API使用手册.md)
+- 阅读 [视频训练设计分析](./视频训练设计分析.md) 了解优化建议
+- 查看 Docker 容器日志排查问题
+
+---
+
+## 📄 许可证
+
+本项目基于 FlexGaussian 开发。详见 [FlexGaussian/LICENSE.md](./FlexGaussian/LICENSE.md)。
+
+---
+
+**最后更新**: 2026-09-20

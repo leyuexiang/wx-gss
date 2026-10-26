@@ -1,0 +1,48 @@
+services:
+  api:
+    build: .
+    image: 3dgs:latest
+    container_name: 3dgs-api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --reload
+    ports:
+      - "12524:8000"
+    env_file: .env
+    volumes:
+      - /home/3dgs/data:/data
+      - /home/3dgs/app:/app/app
+    networks:
+      - 3dgs-net
+      - smartlens-net
+    restart: unless-stopped
+
+  worker:
+    image: 3dgs:latest
+    container_name: 3dgs-worker
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=1 -Q 3dgs
+    env_file: .env
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      # graphics 能力让 nvidia-container-toolkit 把 EGL/GL 驱动库挂进容器，
+      # COLMAP GPU SIFT 才能用 Qt offscreen + EGL 创建 GPU GL 上下文
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+      QT_QPA_PLATFORM: offscreen
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - /home/3dgs/data:/data
+      - /home/3dgs/app:/app/app
+    networks:
+      - 3dgs-net
+      - smartlens-net
+    restart: unless-stopped
+
+networks:
+  3dgs-net:
+    driver: bridge
+  smartlens-net:
+    external: true
