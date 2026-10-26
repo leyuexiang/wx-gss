@@ -8,6 +8,7 @@ import re
 import shutil
 import asyncio
 import math
+import zipfile
 from datetime import datetime
 from functools import lru_cache
 from typing import Optional
@@ -16,6 +17,10 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from app import config
 from app.celery_app import celery_app
+from app.object_capture import (
+    IMAGE_EXTENSIONS, MAX_OBJECT_INPUTS, MIN_OBJECT_IMAGES,
+    extract_photo_archive, prepare_object_views,
+)
 
 # 创建路由
 router = APIRouter(prefix="/api/3dgs", tags=["3DGS Management"])
@@ -386,6 +391,8 @@ async def extract_video_frames(video_path: str, output_dir: str, video_config: d
         effective_duration = min(end_time, duration) - start_time
     elif start_time > 0:
         effective_duration = duration - start_time
+    if effective_duration <= 0:
+        raise ValueError("视频抽帧时间范围无效，或无法读取视频时长")
 
     quality_map = {'low': 5, 'medium': 2, 'high': 1}
     q_value = quality_map.get(quality, 2)
@@ -480,8 +487,9 @@ async def extract_video_frames(video_path: str, output_dir: str, video_config: d
 @router.post("/generate")
 async def generate_3dgs(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
     modelName: str = Form(...),
+    file: Optional[UploadFile] = File(None),
+    images: Optional[list[UploadFile]] = File(None),
     iterations: int = Form(7000),
     resolution: int = Form(1),
     sceneType: str = Form("outdoor"),
@@ -494,18 +502,6 @@ async def generate_3dgs(
 
     task_id = uuid.uuid4().hex
     is_video = isVideo.lower() == "true"
-    if is_video:
-        video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.webm')
-        if not any(file.filename.lower().endswith(ext) for ext in video_extensions):
-            raise HTTPException(status_code=400, detail="不支持的视频格式")
-        input_name = "input_video" + os.path.splitext(file.filename)[1].lower()
-    else:
-        if not file.filename.lower().endswith('.zip'):
-            raise HTTPException(status_code=400, detail="只支持 ZIP 文件")
-        input_name = "input.zip"
-
-    if not 500 <= iterations <= config.MAX_ITERATIONS or resolution not in (1, 2, 4, 8):
-        raise HTTPException(status_code=400, detail="训练迭代或分辨率参数无效")
     try:
         config_dict = json.loads(generationConfig)
         video_config_dict = json.loads(videoConfig) if is_video else {}
@@ -514,15 +510,63 @@ async def generate_3dgs(
     except (ValueError, TypeError, json.JSONDecodeError):
         raise HTTPException(status_code=400, detail="配置格式无效")
 
+    object_quick = sceneType == "object" and config_dict.get("objectQuick") is True
+    square_crop = config_dict.get("objectSquareCrop", True)
+    target_views = config_dict.get("objectTargetViews", 12)
+    if object_quick and (not isinstance(square_crop, bool) or type(target_views) is not int
+                         or not MIN_OBJECT_IMAGES <= target_views <= 15):
+        raise HTTPException(status_code=400, detail="单物体裁切或视角数量参数无效")
+    photo_uploads = images or []
+    if photo_uploads:
+        if not object_quick or file is not None or is_video:
+            raise HTTPException(status_code=400, detail="多张照片仅支持单物体快速重建，不能与视频或 ZIP 混传")
+        if not MIN_OBJECT_IMAGES <= len(photo_uploads) <= MAX_OBJECT_INPUTS:
+            raise HTTPException(status_code=400, detail=f"单物体照片需 {MIN_OBJECT_IMAGES}-{MAX_OBJECT_INPUTS} 张")
+        if any(os.path.splitext(photo.filename or "")[1].lower() not in IMAGE_EXTENSIONS for photo in photo_uploads):
+            raise HTTPException(status_code=400, detail="包含不支持的照片格式")
+        input_name = "raw_images"
+    elif file is None or not file.filename:
+        raise HTTPException(status_code=400, detail="请选择视频、照片或 ZIP 文件")
+    elif is_video:
+        video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.webm')
+        if not any(file.filename.lower().endswith(ext) for ext in video_extensions):
+            raise HTTPException(status_code=400, detail="不支持的视频格式")
+        input_name = "input_video" + os.path.splitext(file.filename)[1].lower()
+    else:
+        if not file.filename.lower().endswith('.zip'):
+            raise HTTPException(status_code=400, detail="只支持 ZIP 文件")
+        # 快速模式先自行选图，避免训练器再次从原始 ZIP 解压覆盖已选图像。
+        input_name = "input_photos.zip" if object_quick else "input.zip"
+
+    if not 500 <= iterations <= config.MAX_ITERATIONS or resolution not in (1, 2, 4, 8):
+        raise HTTPException(status_code=400, detail="训练迭代或分辨率参数无效")
     task_dir = _task_dir(task_id)
     os.makedirs(task_dir, exist_ok=False)
     input_path = os.path.join(task_dir, input_name)
     try:
-        with open(input_path, "wb") as output:
-            shutil.copyfileobj(file.file, output, length=4 * 1024 * 1024)
-        is_valid, message, _ = validate_zip_or_video(input_path, is_video)
-        if not is_valid:
-            raise HTTPException(status_code=400, detail=message)
+        if photo_uploads:
+            os.makedirs(input_path, exist_ok=True)
+            # 浏览器多选文件的返回顺序不一定稳定，按文件名恢复拍摄顺序。
+            for index, photo in enumerate(sorted(photo_uploads, key=lambda item: item.filename.lower()), start=1):
+                suffix = os.path.splitext(photo.filename)[1].lower()
+                with open(os.path.join(input_path, f"source_{index:04d}{suffix}"), "wb") as output:
+                    shutil.copyfileobj(photo.file, output, length=4 * 1024 * 1024)
+            message = f"已接收 {len(photo_uploads)} 张单物体照片"
+        else:
+            with open(input_path, "wb") as output:
+                shutil.copyfileobj(file.file, output, length=4 * 1024 * 1024)
+            if object_quick and not is_video:
+                count = _count_zip_images(input_path)
+                if not MIN_OBJECT_IMAGES <= count <= MAX_OBJECT_INPUTS:
+                    raise HTTPException(status_code=400, detail=f"单物体 ZIP 需 {MIN_OBJECT_IMAGES}-{MAX_OBJECT_INPUTS} 张照片，当前 {count} 张")
+                message = f"已接收 {count} 张单物体照片"
+            else:
+                is_valid, message, _ = validate_zip_or_video(input_path, is_video)
+                if not is_valid:
+                    raise HTTPException(status_code=400, detail=message)
+    except zipfile.BadZipFile:
+        shutil.rmtree(task_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="ZIP 文件损坏")
     except Exception:
         shutil.rmtree(task_dir, ignore_errors=True)
         raise
@@ -545,7 +589,11 @@ async def generate_3dgs(
         resolution,
         config_dict,
         is_video,
-        video_config_dict
+        video_config_dict,
+        object_quick,
+        square_crop,
+        target_views,
+        bool(photo_uploads),
     )
 
     return {"code": 200, "data": {"taskId": task_id}}
@@ -558,12 +606,37 @@ async def process_generation_task(
     resolution: int,
     generation_config: dict,
     is_video: bool,
-    video_config: dict
+    video_config: dict,
+    object_quick: bool = False,
+    square_crop: bool = True,
+    target_views: int = 12,
+    direct_photos: bool = False,
 ):
     """准备训练输入，再提交已有的 GPU 训练任务。"""
 
     try:
-        if is_video:
+        if object_quick:
+            task_dir = _task_dir(task_id)
+            raw_dir = os.path.join(task_dir, "raw_images")
+            image_dir = os.path.join(task_dir, "images")
+            _update_task_status(task_id, status="preparing", stage="extract", progress=0.02)
+            if is_video:
+                _append_task_log(task_id, "开始均匀抽取单物体视频视角")
+                # 先均匀取样，再按拍摄顺序分段选清晰帧，兼顾画质和环绕覆盖。
+                quick_video = {"extractionMode": "count", "totalFrames": 80, "quality": "high",
+                               "removeBlurry": False, "removeDuplicates": False,
+                               "startTime": video_config.get("startTime", 0),
+                               "endTime": video_config.get("endTime", 0)}
+                await extract_video_frames(file_path, raw_dir, quick_video)
+            elif not direct_photos:
+                _append_task_log(task_id, "开始解压单物体照片")
+                await asyncio.to_thread(extract_photo_archive, file_path, raw_dir)
+            # 解压和逐张解码会占用 CPU，放到线程中避免阻塞 API 的其他请求。
+            result = await asyncio.to_thread(prepare_object_views, raw_dir, image_dir, target_views, square_crop)
+            frame_count = result["selected_count"]
+            sfm_backend = "mast3r"
+            _append_task_log(task_id, f"单物体选图完成：输入 {result['input_count']} 张，选出 {frame_count} 张，主体清晰度中位数 {result['median_focus']}")
+        elif is_video:
             _append_task_log(task_id, "开始视频抽帧")
             _update_task_status(task_id, status="preparing", stage="extract", progress=0.02)
             image_dir = os.path.join(_task_dir(task_id), "images")
@@ -578,12 +651,14 @@ async def process_generation_task(
         else:
             frame_count = _count_zip_images(file_path)
 
-        sfm_backend = _select_sfm_backend(frame_count)
+        if not object_quick:
+            sfm_backend = _select_sfm_backend(frame_count)
         advanced = generation_config.get("advanced", {})
         if not isinstance(advanced, dict):
             advanced = {}
         # 前端配置中的实验选项只传递训练器已实现的参数。
-        enable_depth_reg = bool(advanced.get("depthRegularization", False))
+        # 快速预览不启用实验性深度约束，降低 8GB 显卡的耗时和显存占用。
+        enable_depth_reg = False if object_quick else bool(advanced.get("depthRegularization", False))
         params = {
             "iterations": iterations, "downsample": resolution,
             "cap_max": config.DEFAULT_CAP_MAX, "sfm_backend": sfm_backend,

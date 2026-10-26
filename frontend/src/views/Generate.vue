@@ -11,14 +11,20 @@
             </div>
           </template>
 
+          <div style="margin-bottom: 16px">
+            <el-switch v-model="form.objectQuick" active-text="单物体快速重建" inactive-text="普通场景重建" @change="handleObjectModeChange" />
+          </div>
+
           <el-upload
             ref="uploadRef"
             class="upload-zone"
             drag
             :auto-upload="false"
             :on-change="handleFileChange"
-            :limit="1"
-            accept=".zip,.mp4,.avi,.mov,.mkv,.webm"
+            :on-remove="handleFileRemove"
+            :multiple="form.objectQuick"
+            :limit="form.objectQuick ? 50 : 1"
+            :accept="form.objectQuick ? '.zip,.mp4,.avi,.mov,.mkv,.webm,.jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff' : '.zip,.mp4,.avi,.mov,.mkv,.webm'"
             :file-list="fileList"
           >
             <el-icon class="upload-icon"><FolderOpened /></el-icon>
@@ -27,8 +33,8 @@
               <div class="upload-tip">
                 <div>• 支持 ZIP 压缩包（包含图像序列）</div>
                 <div>• 支持视频文件（MP4/AVI/MOV/MKV/WebM）</div>
-                <div>• 视频会自动抽帧处理</div>
-                <div>• 建议 50+ 张图像或 30 秒以上视频</div>
+                <div v-if="form.objectQuick">• 可直接多选 8–50 张按环绕顺序拍摄的照片；视频会自动选出清晰视角</div>
+                <div v-else>• 建议 50+ 张图像或 30 秒以上视频</div>
               </div>
             </template>
           </el-upload>
@@ -42,6 +48,10 @@
                       <el-icon><VideoCamera /></el-icon>
                       视频文件: {{ fileList[0].name }}
                     </span>
+                    <span v-else-if="isPhotoSet">
+                      <el-icon><Folder /></el-icon>
+                      已选择 {{ fileList.length }} 张照片
+                    </span>
                     <span v-else>
                       <el-icon><Folder /></el-icon>
                       已选择文件: {{ fileList[0].name }}
@@ -53,7 +63,10 @@
             </el-alert>
 
             <!-- 视频抽帧配置 -->
-            <el-card class="frame-extraction-card" v-if="isVideoFile" shadow="never">
+            <el-alert v-if="form.objectQuick" type="info" :closable="false" show-icon style="margin-top: 12px">
+              <template #title>保持物体静止、相机环绕拍摄，主体居中且光线稳定。系统均匀覆盖视角并选清晰图；背景仍可能进入模型。</template>
+            </el-alert>
+            <el-card class="frame-extraction-card" v-if="isVideoFile && !form.objectQuick" shadow="never">
               <template #header>
                 <div style="display: flex; align-items: center; gap: 8px">
                   <el-icon><VideoCameraFilled /></el-icon>
@@ -246,7 +259,7 @@
                 </el-form-item>
 
                 <el-form-item label="场景类型">
-                  <el-select v-model="form.sceneType" placeholder="选择场景类型">
+                  <el-select v-model="form.sceneType" placeholder="选择场景类型" @change="handleSceneTypeChange">
                     <el-option label="室外场景" value="outdoor">
                       <div>
                         <div><strong>室外场景</strong></div>
@@ -259,14 +272,24 @@
                         <div style="font-size: 12px; color: #909399">房间、展厅等封闭空间</div>
                       </div>
                     </el-option>
-                    <el-option label="物体/人物" value="object">
+                    <el-option label="单个物体" value="object">
                       <div>
-                        <div><strong>物体/人物</strong></div>
-                        <div style="font-size: 12px; color: #909399">单个物体或人物的 360° 拍摄</div>
+                        <div><strong>单个物体</strong></div>
+                        <div style="font-size: 12px; color: #909399">静止物体的环绕拍摄</div>
                       </div>
                     </el-option>
                   </el-select>
                 </el-form-item>
+                <template v-if="form.objectQuick">
+                  <el-form-item label="选取视角数">
+                    <el-input-number v-model="form.objectTargetViews" :min="8" :max="15" />
+                    <div class="param-hint">先用 12 个视角快速预览；照片按拍摄顺序命名，建议拍摄完整一圈。</div>
+                  </el-form-item>
+                  <el-form-item label="居中正方形裁切">
+                    <el-switch v-model="form.objectSquareCrop" />
+                    <div class="param-hint">主体始终居中时开启；物体靠近画面边缘时关闭，避免裁掉主体。</div>
+                  </el-form-item>
+                </template>
               </el-form>
             </el-tab-pane>
 
@@ -549,7 +572,7 @@
           <div v-else class="preview-content">
             <el-descriptions :column="1" border size="small">
               <el-descriptions-item label="文件名">
-                {{ fileList[0].name }}
+                {{ isPhotoSet ? `${fileList.length} 张照片` : fileList[0].name }}
               </el-descriptions-item>
               <el-descriptions-item label="模型名称">
                 {{ form.modelName || '未设置' }}
@@ -714,6 +737,7 @@ const currentTask = ref(null)
 const models = ref([])
 const activeTab = ref('basic')
 const isVideoFile = ref(false)
+const isPhotoSet = ref(false)
 let statusCheckInterval = null
 
 const iterationMarks = {
@@ -728,6 +752,9 @@ const form = reactive({
   iterations: 7000,
   resolution: 2,
   sceneType: 'outdoor',
+  objectQuick: false,
+  objectSquareCrop: true,
+  objectTargetViews: 12,
   colmap: {
     featureExtractor: 'sift-gpu',
     matcher: 'sequential'
@@ -783,7 +810,7 @@ const sceneTypeText = computed(() => {
   const map = {
     'outdoor': '室外场景',
     'indoor': '室内场景',
-    'object': '物体/人物'
+    'object': '单个物体'
   }
   return map[form.sceneType] || '-'
 })
@@ -814,27 +841,59 @@ const estimatedTime = computed(() => {
 })
 
 const canGenerate = computed(() => {
-  return fileList.value.length > 0 && form.modelName.trim().length > 0
+  return fileList.value.length > 0 && (!isPhotoSet.value || fileList.value.length >= 8)
+    && form.modelName.trim().length > 0
 })
 
-const handleFileChange = (file) => {
+const handleObjectModeChange = (enabled) => {
+  handleClear()
+  form.sceneType = enabled ? 'object' : 'outdoor'
+  if (enabled) {
+    // 少视角先用轻量参数出预览，满意后可手动提高迭代和分辨率。
+    form.iterations = 3000
+    form.resolution = 2
+    form.advanced.depthRegularization = false
+    form.autoOptimize = false
+  }
+}
+
+const handleSceneTypeChange = (value) => {
+  if ((value === 'object') !== form.objectQuick) {
+    form.objectQuick = value === 'object'
+    handleObjectModeChange(form.objectQuick)
+    form.sceneType = value
+  }
+}
+
+const handleFileChange = (file, uploadFiles) => {
   const videoExtensions = ['.mp4', '.avi', '.mov', '.mkv', '.webm']
+  const imageExtensions = ['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff']
   const fileName = file.name.toLowerCase()
 
   const isVideo = videoExtensions.some(ext => fileName.endsWith(ext))
   const isZip = fileName.endsWith('.zip')
+  const isImage = imageExtensions.some(ext => fileName.endsWith(ext))
 
-  if (!isVideo && !isZip) {
-    ElMessage.error('只支持 ZIP 或视频文件（MP4/AVI/MOV/MKV/WebM）')
-    fileList.value = []
-    isVideoFile.value = false
+  if (!isVideo && !isZip && !(form.objectQuick && isImage)) {
+    ElMessage.error('请选择支持的照片、ZIP 或视频文件')
+    handleClear()
     return
   }
-
-  fileList.value = [file]
+  if (isImage && uploadFiles.some(item => item.uid !== file.uid && !imageExtensions.some(ext => item.name.toLowerCase().endsWith(ext)))) {
+    ElMessage.error('照片不能与 ZIP 或视频混传')
+    handleClear()
+    return
+  }
+  if (!isImage && uploadFiles.length > 1) {
+    ElMessage.error('ZIP 或视频只能单独上传')
+    handleClear()
+    return
+  }
+  fileList.value = isImage ? uploadFiles : [file]
   isVideoFile.value = isVideo
+  isPhotoSet.value = isImage
 
-  if (!form.modelName) {
+  if (!form.modelName && !isImage) {
     const nameWithoutExt = file.name.replace(/\.(zip|mp4|avi|mov|mkv|webm)$/i, '')
     form.modelName = nameWithoutExt
   }
@@ -849,7 +908,17 @@ const handleFileChange = (file) => {
 
 const handleClear = () => {
   fileList.value = []
+  isVideoFile.value = false
+  isPhotoSet.value = false
   uploadRef.value?.clearFiles()
+}
+
+const handleFileRemove = (_file, uploadFiles) => {
+  fileList.value = uploadFiles
+  if (!uploadFiles.length) {
+    isVideoFile.value = false
+    isPhotoSet.value = false
+  }
 }
 
 const handleAutoOptimizeChange = (value) => {
@@ -868,7 +937,11 @@ const handleGenerate = async () => {
 
   try {
     const formData = new FormData()
-    formData.append('file', fileList.value[0].raw)
+    if (isPhotoSet.value) {
+      fileList.value.forEach(photo => formData.append('images', photo.raw))
+    } else {
+      formData.append('file', fileList.value[0].raw)
+    }
     formData.append('modelName', form.modelName)
     formData.append('iterations', form.iterations)
     formData.append('resolution', form.resolution)
@@ -882,7 +955,10 @@ const handleGenerate = async () => {
 
     formData.append('config', JSON.stringify({
       colmap: form.colmap,
-      advanced: form.advanced
+      advanced: form.advanced,
+      objectQuick: form.objectQuick,
+      objectSquareCrop: form.objectSquareCrop,
+      objectTargetViews: form.objectTargetViews
     }))
 
     const res = await generate3DGS(formData)
