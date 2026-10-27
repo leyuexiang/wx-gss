@@ -111,6 +111,8 @@ def clean_gaussians(ply_path: str, opacity_threshold: float = 0.1, distance_perc
 
     # 提取数据
     xyz = np.stack([vertex['x'], vertex['y'], vertex['z']], axis=1)
+    if len(xyz) == 0:
+        raise ValueError("模型没有高斯点，不能执行清理")
     opacity_logit = vertex['opacity']
 
     # 应用 sigmoid 转换
@@ -127,6 +129,8 @@ def clean_gaussians(ply_path: str, opacity_threshold: float = 0.1, distance_perc
 
     # 组合过滤
     mask = mask_opacity & mask_distance
+    if not mask.any():
+        raise ValueError("清理条件删除了全部高斯点，请降低过滤阈值")
 
     kept = mask.sum()
     removed = (~mask).sum()
@@ -163,8 +167,14 @@ def export_gaussians(params: dict, out_dir: str, auto_cleanup: bool = True,
     if denoise_config is None:
         denoise_config = {}
 
+    # 在任何尺寸或离群过滤之前留存完整结果，便于同一次训练的后处理对照。
+    raw_path = os.path.join(out_dir, "point_cloud_raw.ply")
+    export_ply(params, raw_path)
+    raw_count = int(params["means"].shape[0])
+    removed_by_size = 0
+
     size_filtering = denoise_config.get('size_filtering', {})
-    enable_size_filtering = size_filtering.get('enable', False)
+    enable_size_filtering = denoise_config.get('enable', True) and size_filtering.get('enable', False)
     min_size_threshold = size_filtering.get('min_size', 0.0001)
     max_size_threshold = size_filtering.get('max_size', 0.1)
 
@@ -180,8 +190,10 @@ def export_gaussians(params: dict, out_dir: str, auto_cleanup: bool = True,
             print(f"尺寸过滤: 删除 {removed_by_size} 个高斯 (< {min_size_threshold} 或 > {max_size_threshold})")
 
             # 过滤参数
-            for key in params.keys():
-                params[key] = params[key][size_mask]
+            if not size_mask.any():
+                raise ValueError("尺寸过滤删除了全部高斯点，请调整尺寸阈值")
+            # 仅生成导出视图，不修改训练参数，保证后续评估与原始模型一致。
+            params = {key: value[size_mask] for key, value in params.items()}
 
     # 导出 PLY
     ply_path = os.path.join(out_dir, "point_cloud.ply")
@@ -191,7 +203,10 @@ def export_gaussians(params: dict, out_dir: str, auto_cleanup: bool = True,
     # 自动清理
     if auto_cleanup:
         print(f"执行自动清理（阈值: {cleanup_threshold}）...")
-        kept, removed = clean_gaussians(ply_path, opacity_threshold=cleanup_threshold)
+        kept, removed = clean_gaussians(
+            ply_path, opacity_threshold=cleanup_threshold,
+            distance_percentile=denoise_config.get("distance_percentile", 95),
+        )
 
     # 已清理 PLY 时必须从它导出 SPLAT，否则查看器仍会显示被删掉的杂点。
     splat_path = os.path.join(out_dir, "point_cloud.splat")
@@ -200,4 +215,13 @@ def export_gaussians(params: dict, out_dir: str, auto_cleanup: bool = True,
     else:
         export_splat(params, splat_path)
     print(f"导出 SPLAT: {splat_path}")
-    return int(kept) if auto_cleanup else int(params["means"].shape[0])
+    exported_count = int(kept) if auto_cleanup else int(params["means"].shape[0])
+    # 逐阶段数量可以识别清理是否过强，不能把删点比例直接当作质量提升。
+    import json
+    report = {"before_cleanup": raw_count, "removed_by_size": removed_by_size,
+              "after_size_filter": int(params["means"].shape[0]), "exported_count": exported_count,
+              "auto_cleanup": auto_cleanup, "opacity_threshold": cleanup_threshold,
+              "distance_percentile": denoise_config.get("distance_percentile", 95)}
+    with open(os.path.join(out_dir, "cleanup_report.json"), "w", encoding="utf-8") as output:
+        json.dump(report, output, ensure_ascii=False, indent=2)
+    return exported_count

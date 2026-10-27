@@ -7,11 +7,13 @@
 """
 
 import os
+from collections import OrderedDict
 
 import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+from app.camera_geometry import camera_normalization
 
 
 def _quat_to_rotmat(qvec) -> np.ndarray:
@@ -58,7 +60,7 @@ class ColmapScene:
         self.depth_dir = os.path.join(dataset_dir, "depths")
         self.has_depth = os.path.isdir(self.depth_dir)
 
-        names, camtoworlds, Ks = [], [], []
+        names, camtoworlds, Ks, dimensions = [], [], [], []
         for img_id, img in sorted(rec.images.items()):
             cam = rec.cameras[img.camera_id]
             params = np.asarray(cam.params, dtype=np.float64)
@@ -67,10 +69,14 @@ class ColmapScene:
             else:                       # SIMPLE_PINHOLE
                 fx = fy = params[0]
                 cx, cy = params[1], params[2]
-            scale = 1.0 / factor
+            # 使用实际像素尺寸换算内参，处理奇数尺寸取整后的横纵比例差异。
+            with Image.open(os.path.join(self.image_dir, img.name)) as image:
+                width, height = image.size
+            sx, sy = width / cam.width, height / cam.height
+            dimensions.append({"name": img.name, "width": width, "height": height})
             Ks.append([
-                [fx * scale, 0, cx * scale],
-                [0, fy * scale, cy * scale],
+                [fx * sx, 0, cx * sx],
+                [0, fy * sy, cy * sy],
                 [0, 0, 1],
             ])
             camtoworlds.append(np.linalg.inv(_image_w2c(img)))
@@ -79,9 +85,7 @@ class ColmapScene:
         camtoworlds = np.stack(camtoworlds)
 
         # 场景归一化：相机中心平移到原点，缩放到单位球内
-        center = camtoworlds[:, :3, 3].mean(axis=0)
-        max_dist = np.linalg.norm(camtoworlds[:, :3, 3] - center, axis=-1).max()
-        scene_scale = 1.0 / (max_dist * 1.05) if max_dist > 1e-6 else 1.0
+        center, scene_scale = camera_normalization(camtoworlds[:, :3, 3], dataset_dir)
         T = np.eye(4)
         T[:3, 3] = -center
         S = np.eye(4) * scene_scale
@@ -98,6 +102,7 @@ class ColmapScene:
         points = (transform[:3, :3] @ points.T).T + transform[:3, 3]
 
         self.names = names
+        self.dimensions = dimensions
         self.camtoworlds = camtoworlds.astype(np.float32)
         self.Ks = np.asarray(Ks, dtype=np.float32)
         self.points = points.astype(np.float32)
@@ -107,16 +112,28 @@ class ColmapScene:
 
 
 class ColmapDataset(Dataset):
-    def __init__(self, scene: ColmapScene):
+    def __init__(self, scene: ColmapScene, cache_bytes: int = 64 * 1024**2, uint8_images=False):
         self.scene = scene
+        self.uint8_images = uint8_images
+        # 有界缓存减少随机训练反复解码，避免高分辨率数据全部常驻内存。
+        self.cache_bytes = cache_bytes
+        self._cache = OrderedDict()
+        self._cached_bytes = 0
 
     def __len__(self):
         return self.scene.n_images
 
     def __getitem__(self, idx):
+        if idx in self._cache:
+            self._cache.move_to_end(idx)
+            return self._cache[idx]
         path = os.path.join(self.scene.image_dir, self.scene.names[idx])
-        img = Image.open(path).convert("RGB")
-        arr = torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0).permute(2, 0, 1)
+        with Image.open(path) as img:
+            if self.uint8_images:
+                # 训练缓存保留八位像素，内存占用为浮点图的 1/4，归一化交给显卡。
+                arr = torch.from_numpy(np.array(img.convert("RGB"), dtype=np.uint8)).permute(2, 0, 1).contiguous()
+            else:
+                arr = torch.from_numpy(np.array(img.convert("RGB"), dtype=np.float32) / 255.0).permute(2, 0, 1)
 
         data = {
             "image": arr,                                            # [3,H,W]
@@ -133,4 +150,12 @@ class ColmapDataset(Dataset):
                 depth = np.load(depth_path)
                 data["depth"] = torch.from_numpy(depth)  # [H,W]
 
+        byte_size = sum(value.numel() * value.element_size() for value in data.values() if torch.is_tensor(value))
+        if byte_size <= self.cache_bytes:
+            while self._cache and self._cached_bytes + byte_size > self.cache_bytes:
+                _, previous = self._cache.popitem(last=False)
+                self._cached_bytes -= sum(value.numel() * value.element_size() for value in previous.values()
+                                          if torch.is_tensor(value))
+            self._cache[idx] = data
+            self._cached_bytes += byte_size
         return data

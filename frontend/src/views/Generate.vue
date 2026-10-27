@@ -12,7 +12,11 @@
           </template>
 
           <div style="margin-bottom: 16px">
-            <el-switch v-model="form.objectQuick" active-text="单物体快速重建" inactive-text="普通场景重建" @change="handleObjectModeChange" />
+            <el-switch v-model="form.objectQuick" active-text="单物体重建" inactive-text="普通场景重建" @change="handleObjectModeChange" />
+            <el-radio-group v-if="form.objectQuick" v-model="form.qualityMode" style="margin-left: 16px" @change="handleQualityModeChange">
+              <el-radio-button value="quick">快速预览</el-radio-button>
+              <el-radio-button value="high">高质量重建</el-radio-button>
+            </el-radio-group>
           </div>
 
           <el-upload
@@ -23,7 +27,7 @@
             :on-change="handleFileChange"
             :on-remove="handleFileRemove"
             :multiple="form.objectQuick"
-            :limit="form.objectQuick ? 50 : 1"
+            :limit="form.objectQuick ? (form.qualityMode === 'high' ? 200 : 50) : 1"
             :accept="form.objectQuick ? '.zip,.mp4,.avi,.mov,.mkv,.webm,.jpg,.jpeg,.png,.webp,.bmp,.tif,.tiff' : '.zip,.mp4,.avi,.mov,.mkv,.webm'"
             :file-list="fileList"
           >
@@ -33,7 +37,7 @@
               <div class="upload-tip">
                 <div>• 支持 ZIP 压缩包（包含图像序列）</div>
                 <div>• 支持视频文件（MP4/AVI/MOV/MKV/WebM）</div>
-                <div v-if="form.objectQuick">• 可直接多选 8–50 张按环绕顺序拍摄的照片；视频会自动选出清晰视角</div>
+                <div v-if="form.objectQuick">• {{ form.qualityMode === 'high' ? '高质量：20–200' : '快速预览：8–50' }} 张按环绕顺序拍摄的照片；视频会分段选取清晰视角</div>
                 <div v-else>• 建议 50+ 张图像或 30 秒以上视频</div>
               </div>
             </template>
@@ -64,7 +68,7 @@
 
             <!-- 视频抽帧配置 -->
             <el-alert v-if="form.objectQuick" type="info" :closable="false" show-icon style="margin-top: 12px">
-              <template #title>保持物体静止、相机环绕拍摄，主体居中且光线稳定。系统均匀覆盖视角并选清晰图；背景仍可能进入模型。</template>
+              <template #title>保持物体静止、相机缓慢环绕，锁定手机自动对焦和曝光，避免反光桌面与强背光；主体居中且光线稳定。系统均匀覆盖视角并选清晰图，背景仍可能进入模型。</template>
             </el-alert>
             <el-card class="frame-extraction-card" v-if="isVideoFile && !form.objectQuick" shadow="never">
               <template #header>
@@ -236,7 +240,7 @@
                     :input-size="'small'"
                   />
                   <div class="param-hint">
-                    推荐 7000-15000 次，迭代次数越多质量越好但耗时更长
+                    建议先训练 7000 次，再根据对照增加；训练更久可能降低新视角质量
                   </div>
                 </el-form-item>
 
@@ -282,8 +286,8 @@
                 </el-form-item>
                 <template v-if="form.objectQuick">
                   <el-form-item label="选取视角数">
-                    <el-input-number v-model="form.objectTargetViews" :min="8" :max="15" />
-                    <div class="param-hint">先用 12 个视角快速预览；照片按拍摄顺序命名，建议拍摄完整一圈。</div>
+                    <el-input-number v-model="form.objectTargetViews" :min="form.qualityMode === 'high' ? 20 : 8" :max="form.qualityMode === 'high' ? 200 : 15" />
+                    <div class="param-hint">{{ form.qualityMode === 'high' ? '建议 50–100 个视角，使用 COLMAP；先分段选清晰帧再重建。' : '默认 12 个视角，使用 MASt3R 快速预览。' }} 照片请按拍摄顺序命名。</div>
                   </el-form-item>
                   <el-form-item label="居中正方形裁切">
                     <el-switch v-model="form.objectSquareCrop" />
@@ -315,11 +319,18 @@
                   <el-select v-model="form.colmap.matcher">
                     <el-option label="Sequential (顺序)" value="sequential" />
                     <el-option label="Exhaustive (穷举)" value="exhaustive" />
-                    <el-option label="Vocab Tree (词汇树)" value="vocab_tree" />
+                    <el-option label="自动选择" value="auto" />
                   </el-select>
                   <div class="param-hint">
                     顺序匹配适合视频序列，穷举适合无序照片
                   </div>
+                </el-form-item>
+                <el-form-item label="相机模型">
+                  <el-select v-model="form.colmap.cameraModel">
+                    <el-option label="单焦距与径向畸变（手机视频优先）" value="SIMPLE_RADIAL" />
+                    <el-option label="针孔模型" value="PINHOLE" />
+                    <el-option label="完整畸变模型" value="OPENCV" />
+                  </el-select>
                 </el-form-item>
 
                 <el-divider content-position="left">
@@ -334,6 +345,30 @@
                   </div>
                 </el-form-item>
 
+                <el-form-item label="训练策略">
+                  <el-select v-model="form.advanced.strategy">
+                    <el-option label="现有增密策略（MCMC）" value="mcmc" />
+                    <el-option label="原版风格增密（对照）" value="default" />
+                  </el-select>
+                  <div class="param-hint">原版风格为对照选项；一次增密的临时显存可能高于裁剪后的预算。</div>
+                </el-form-item>
+                <el-form-item label="高斯点上限">
+                  <el-input-number v-model="form.advanced.maxGaussians" :min="100000" :max="1500000" :step="100000" />
+                </el-form-item>
+                <el-form-item label="重建最大边长">
+                  <el-input-number v-model="form.advanced.maxImageSize" :min="512" :max="8192" :step="256" />
+                  <div class="param-hint">COLMAP 去畸变先限制边长，再应用训练降采样；完成后可查看实际训练尺寸。</div>
+                </el-form-item>
+                <el-form-item label="留出验证间隔">
+                  <el-input-number v-model="form.advanced.validationEvery" :min="0" :max="100" />
+                  <div class="param-hint">0 表示关闭；建议 8，每 8 张留出一张不参与颜色损失训练。重建仍可能使用全部输入。</div>
+                </el-form-item>
+
+                <el-form-item label="阶段保存间隔">
+                  <el-input-number v-model="form.advanced.checkpointEvery" :min="0" :max="30000" :step="1000" />
+                  <div class="param-hint">0 表示关闭；建议 1000，需启用留出验证。另存阶段模型和指标，结果包包含验证最佳阶段，会增加磁盘占用。</div>
+                </el-form-item>
+
                 <el-form-item label="密集化间隔">
                   <el-input-number v-model="form.advanced.densifyInterval" :min="100" :max="500" :step="100" />
                   <div class="param-hint">
@@ -342,9 +377,9 @@
                 </el-form-item>
 
                 <el-form-item label="不透明度重置">
-                  <el-input-number v-model="form.advanced.opacityReset" :min="1000" :max="5000" :step="1000" />
+                  <el-input-number v-model="form.advanced.opacityReset" :disabled="form.advanced.strategy !== 'default'" :min="1000" :max="5000" :step="1000" />
                   <div class="param-hint">
-                    默认 3000 次迭代重置不透明度
+                    仅原版风格策略使用，默认每 3000 次迭代重置
                   </div>
                 </el-form-item>
 
@@ -368,19 +403,6 @@
                 </el-form-item>
 
                 <template v-if="form.advanced.enableDenoising">
-                  <el-form-item label="去噪强度">
-                    <el-slider
-                      v-model="form.advanced.denoiseStrength"
-                      :min="0"
-                      :max="100"
-                      :marks="{ 0: '弱', 50: '中', 100: '强' }"
-                      show-stops
-                    />
-                    <div class="param-hint">
-                      强度越高，去噪效果越明显，但可能丢失细节
-                    </div>
-                  </el-form-item>
-
                   <el-form-item label="不透明度阈值">
                     <el-input-number
                       v-model="form.advanced.opacityThreshold"
@@ -423,7 +445,7 @@
                       :precision="1"
                     />
                     <div class="param-hint">
-                      默认 2.0，大于此值的过大高斯点将被分裂或移除
+                      默认 2.0，导出时剔除超过阈值的高斯点；清理前结果会单独保留
                     </div>
                   </el-form-item>
                 </template>
@@ -435,7 +457,7 @@
                   </span>
                 </el-form-item>
 
-                <el-form-item label="平滑正则化" v-if="form.advanced.gradientClipping">
+                <el-form-item label="全局尺度方差约束">
                   <el-slider
                     v-model="form.advanced.smoothnessWeight"
                     :min="0"
@@ -446,14 +468,14 @@
                     :input-size="'small'"
                   />
                   <div class="param-hint">
-                    增加平滑约束，减少视觉噪声，默认 0.1
+                    实验性约束，默认关闭；它不等同于局部去噪，全局位置收缩约束保持关闭。
                   </div>
                 </el-form-item>
 
                 <el-form-item label="深度正则化">
                   <el-switch v-model="form.advanced.depthRegularization" />
                   <span style="margin-left: 10px; color: #909399">
-                    改善深度一致性，减少漂浮物
+                    使用已有深度数据约束；COLMAP 流程没有深度数据时不生效
                   </span>
                 </el-form-item>
 
@@ -753,27 +775,35 @@ const form = reactive({
   resolution: 2,
   sceneType: 'outdoor',
   objectQuick: false,
+  qualityMode: 'quick',
   objectSquareCrop: true,
   objectTargetViews: 12,
   colmap: {
     featureExtractor: 'sift-gpu',
-    matcher: 'sequential'
+    matcher: 'sequential',
+    cameraModel: 'OPENCV'
   },
   advanced: {
     positionLR: 0.00016,
     densifyInterval: 100,
     opacityReset: 3000,
     shDegree: 3,
+    strategy: 'mcmc',
+    maxGaussians: 500000,
+    maxImageSize: 2000,
+    validationEvery: 0,
+    checkpointEvery: 0,
+    seed: 42,
     // 去噪和质量优化
     enableDenoising: true,
     denoiseStrength: 50,
     opacityThreshold: 0.005,
-    sizeFiltering: true,
+    sizeFiltering: false,
     minSizeThreshold: 0.0002,
     maxSizeThreshold: 2.0,
     gradientClipping: true,
-    smoothnessWeight: 0.1,
-    depthRegularization: true,
+    smoothnessWeight: 0,
+    depthRegularization: false,
     antiAliasing: true
   },
   autoOptimize: false,
@@ -841,7 +871,7 @@ const estimatedTime = computed(() => {
 })
 
 const canGenerate = computed(() => {
-  return fileList.value.length > 0 && (!isPhotoSet.value || fileList.value.length >= 8)
+  return fileList.value.length > 0 && (!isPhotoSet.value || fileList.value.length >= (form.qualityMode === 'high' ? 20 : 8))
     && form.modelName.trim().length > 0
 })
 
@@ -850,11 +880,29 @@ const handleObjectModeChange = (enabled) => {
   form.sceneType = enabled ? 'object' : 'outdoor'
   if (enabled) {
     // 少视角先用轻量参数出预览，满意后可手动提高迭代和分辨率。
-    form.iterations = 3000
-    form.resolution = 2
+    handleQualityModeChange(form.qualityMode)
     form.advanced.depthRegularization = false
     form.autoOptimize = false
   }
+}
+
+const handleQualityModeChange = (mode) => {
+  // 质量目标与场景类型分开；切换质量预设不清空已经选择的视频。
+  const high = mode === 'high'
+  // 同素材的 15000 次对照出现新视角退化，高质量预设先采用已验证的 7000 次。
+  form.iterations = high ? 7000 : 3000
+  form.resolution = high ? 1 : 2
+  form.objectTargetViews = high ? 60 : 12
+  // 高质量流程保留原画幅，并让中等规模视角进行完整匹配，与本次验证的数据准备一致。
+  form.objectSquareCrop = !high
+  form.colmap.matcher = high ? 'auto' : 'sequential'
+  form.advanced.validationEvery = high ? 8 : 0
+  // 高质量模式保留阶段结果，避免只得到训练最后一版而错过更清楚的中间模型。
+  form.advanced.checkpointEvery = high ? 1000 : 0
+  form.advanced.strategy = high ? 'default' : 'mcmc'
+  form.colmap.cameraModel = high ? 'SIMPLE_RADIAL' : 'OPENCV'
+  form.advanced.smoothnessWeight = 0
+  form.advanced.depthRegularization = false
 }
 
 const handleSceneTypeChange = (value) => {
@@ -956,7 +1004,9 @@ const handleGenerate = async () => {
     formData.append('config', JSON.stringify({
       colmap: form.colmap,
       advanced: form.advanced,
-      objectQuick: form.objectQuick,
+      sceneType: form.sceneType,
+      qualityMode: form.objectQuick ? form.qualityMode : 'standard',
+      objectQuick: form.objectQuick && form.qualityMode === 'quick',
       objectSquareCrop: form.objectSquareCrop,
       objectTargetViews: form.objectTargetViews
     }))

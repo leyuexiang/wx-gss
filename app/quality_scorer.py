@@ -154,7 +154,7 @@ def calculate_quality_score(stats: dict, params: dict = None):
     # 无建议时的默认提示
     if not recommendations:
         if score >= 90:
-            recommendations.append("质量已经很好，无需调整")
+            recommendations.append("训练运行指标正常；清晰度仍需结合固定视角渲染和验证图像判断")
         else:
             recommendations.append("训练成功完成")
 
@@ -166,6 +166,8 @@ def calculate_quality_score(stats: dict, params: dict = None):
         recommendations.append("如需更好收敛，可尝试增加 iterations 到 5000-7000")
 
     return {
+        "kind": "heuristic_runtime_score",
+        "note": "该分数不是图像质量验证，点数和显存表现不能证明模型清晰",
         "score": score,
         "rating": rating,
         "rating_emoji": rating_emoji,

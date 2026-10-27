@@ -14,7 +14,8 @@ export default defineConfig({
     port: 3000,
     proxy: {
       '/api': {
-        target: 'http://localhost:12524',
+        // 本地开发前端时，将接口请求转发到远程 3DGS 后端。
+        target: 'http://192.168.10.148:12524',
         changeOrigin: true
       }
     }

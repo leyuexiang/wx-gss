@@ -11,6 +11,7 @@
         <el-form-item label="选择模型">
           <el-select
             v-model="viewerForm.modelId"
+            :disabled="loading"
             placeholder="请选择要查看的模型"
             style="width: 100%"
             @change="loadModel"
@@ -28,6 +29,16 @@
               </div>
             </el-option>
           </el-select>
+        </el-form-item>
+
+        <el-form-item label="颜色显示" v-if="currentModel?.displayFormats?.includes('ply')">
+          <el-select v-model="appearanceMode" :disabled="loading" @change="reloadAppearance">
+            <el-option label="固定颜色（原显示）" value="splat" />
+            <el-option label="球谐颜色（最高二阶）" value="ply" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="清理前模型" v-if="currentModel?.hasRawModel && appearanceMode === 'ply'">
+          <el-switch v-model="showRawModel" :disabled="loading" @change="reloadAppearance" />
         </el-form-item>
 
         <el-form-item label="对比模式" v-if="currentModel?.optimizedVersion">
@@ -50,7 +61,13 @@
             {{ currentModel.iterations }}
           </el-descriptions-item>
           <el-descriptions-item label="分辨率" v-if="currentModel.resolution">
-            {{ currentModel.resolution }}
+            宽高各 1/{{ currentModel.resolution }}
+          </el-descriptions-item>
+          <el-descriptions-item label="实际训练尺寸" v-if="currentModel.trainingSize?.length">
+            {{ currentModel.trainingSize[0].width }} × {{ currentModel.trainingSize[0].height }} 像素
+          </el-descriptions-item>
+          <el-descriptions-item label="颜色表现">
+            {{ appearanceMode === 'ply' ? '球谐颜色，最高二阶' : '固定颜色' }}
           </el-descriptions-item>
         </el-descriptions>
       </div>
@@ -147,6 +164,8 @@ const loading = ref(false)
 const autoRotate = ref(false)
 const renderQuality = ref(100)
 const trainingViewIndex = ref(-1)
+const appearanceMode = ref('splat')
+const showRawModel = ref(false)
 const stats = ref(null)
 
 const viewerForm = reactive({ modelId: '', compareMode: false })
@@ -241,7 +260,7 @@ const applyTrainingView = (index) => {
 
 const nextTrainingView = () => {
   const count = currentModel.value?.trainingViews?.length || 0
-  if (!count) return
+  if (!count || !viewer) return
   autoRotate.value = false
   viewer.controls.autoRotate = false
   applyTrainingView((trainingViewIndex.value + 1) % count)
@@ -264,7 +283,9 @@ const initViewer = async (modelId) => {
     initialCameraLookAt: [0, 0, 0],
     sharedMemoryForWorkers: false,
     gpuAcceleratedSort: false,
-    sphericalHarmonicsDegree: 0
+    // 当前查看器仅承诺最高二阶；三阶训练渲染由离线评估保留。
+    sphericalHarmonicsDegree: appearanceMode.value === 'ply' ? Math.min(currentModel.value?.viewerMaxShDegree ?? 2, 2) : 0,
+    antialiased: currentModel.value?.antialiased ?? true
   })
 
   const resize = () => {
@@ -282,9 +303,11 @@ const initViewer = async (modelId) => {
   resizeObserver.observe(host)
   resize()
 
-  await viewer.addSplatScene(`/api/3dgs/model/${encodeURIComponent(modelId)}/point_cloud.splat`, {
-    format: GaussianSplats3D.SceneFormat.Splat,
-    splatAlphaRemovalThreshold: 5,
+  const usePly = appearanceMode.value === 'ply'
+  const modelPath = `/api/3dgs/model/${encodeURIComponent(modelId)}/point_cloud.${usePly ? 'ply' : 'splat'}`
+  await viewer.addSplatScene(modelPath + (usePly && showRawModel.value ? '?raw=true' : ''), {
+    format: usePly ? GaussianSplats3D.SceneFormat.Ply : GaussianSplats3D.SceneFormat.Splat,
+    splatAlphaRemovalThreshold: 0,
     showLoadingUI: false
   })
   frameModel()
@@ -295,11 +318,30 @@ const initViewer = async (modelId) => {
   stats.value = { points: viewer.splatMesh.getSplatCount().toLocaleString() }
 }
 
-const loadModel = async (modelId) => {
+const reloadAppearance = async () => {
+  // 对照显示方式时保留同一相机，避免切换观察角度掩盖实际差异。
+  const saved = viewer ? {
+    position: viewer.camera.position.clone(), up: viewer.camera.up.clone(),
+    target: viewer.controls.target.clone(), fov: viewer.camera.fov,
+    index: trainingViewIndex.value
+  } : null
+  await loadModel(viewerForm.modelId, true)
+  if (saved && viewer) {
+    cameraHome.copy(saved.position)
+    cameraHomeUp.copy(saved.up)
+    targetHome.copy(saved.target)
+    cameraHomeFov = saved.fov
+    trainingViewIndex.value = saved.index
+    resetCamera()
+  }
+}
+
+const loadModel = async (modelId, preserveMetadata = false) => {
   const version = ++loadVersion
   loading.value = true
   viewerError.value = ''
-  currentModel.value = null
+  // 显示方式切换时保留控件，避免开关触发更新时自身被卸载。
+  if (!preserveMetadata) currentModel.value = null
   try {
     await disposeViewer()
     if (!modelId) return

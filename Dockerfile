@@ -47,12 +47,13 @@ RUN git clone --depth 1 -b ${COLMAP_VERSION} ${COLMAP_REPO} /tmp/colmap && \
     cmake --install /tmp/colmap/build && \
     rm -rf /tmp/colmap /tmp/poselib
 
+# 固定 PLY 导出依赖版本，保证新容器与已验证的生产环境一致。
 RUN pip3 config set global.index-url ${PIP_INDEX_URL} && \
     pip3 install --no-cache-dir torch==2.8.0 torchvision==0.23.0 && \
     pip3 install --no-cache-dir gsplat==1.5.3 && \
     pip3 install --no-cache-dir \
         fastapi "uvicorn[standard]" celery redis python-multipart \
-        pycolmap scipy pillow numpy pytorch-msssim plyfile
+        pycolmap scipy pillow numpy pytorch-msssim plyfile==1.1.5
 
 # MASt3R/dust3r 少视角 SfM 后端依赖（源码+权重走 /data 挂载，不打进镜像，见 config.py MAST3R_REPO_DIR）
 RUN pip3 install --no-cache-dir \
@@ -62,3 +63,4 @@ RUN pip3 install --no-cache-dir \
 
 WORKDIR /app
 COPY app/ /app/app/
+COPY scripts/ /app/scripts/

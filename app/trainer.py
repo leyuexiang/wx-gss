@@ -1,8 +1,9 @@
-"""gsplat 训练主循环（MCMC 策略，packed 模式省显存）。"""
+"""gsplat 训练、可选增密策略和固定视角图像评估。"""
 
 import json
 import math
 import os
+import random
 import time
 
 import numpy as np
@@ -87,14 +88,21 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
           cleanup_threshold: float = 0.1, enable_depth_reg: bool = False,
           depth_reg_weight: float = 0.1, enable_pose_opt: bool = False,
           pose_opt_start: int = 500, pose_opt_lr: float = 1e-5,
-          denoise_config: dict = None) -> dict:
-    from gsplat import MCMCStrategy, rasterization
+          denoise_config: dict = None, training_options: dict = None) -> dict:
+    from gsplat import DefaultStrategy, MCMCStrategy, rasterization
     from pytorch_msssim import SSIM
 
     from app.dataset import ColmapDataset, ColmapScene
 
     device = torch.device("cuda")
-    sh_degree = 3
+    options = training_options or {}
+    sh_degree = options.get("sh_degree", 3)
+    seed = options.get("seed", 42)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.cuda.reset_peak_memory_stats()
 
     # 解析去噪配置
     if denoise_config is None:
@@ -102,34 +110,27 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
 
     enable_denoising = denoise_config.get('enable', True)
     opacity_threshold = denoise_config.get('opacity_threshold', 0.005)
-    denoise_strength = denoise_config.get('denoise_strength', 50)
-
-    size_filtering = denoise_config.get('size_filtering', {})
-    enable_size_filtering = size_filtering.get('enable', True)
-    min_size_threshold = size_filtering.get('min_size', 0.0001)
-    max_size_threshold = size_filtering.get('max_size', 0.1)
-
     gradient_clipping = denoise_config.get('gradient_clipping', {})
     enable_gradient_clipping = gradient_clipping.get('enable', True)
     max_grad_norm = gradient_clipping.get('max_norm', 1.0)
 
     regularization = denoise_config.get('regularization', {})
-    smoothness_weight = regularization.get('smoothness_weight', 0.01)
-    depth_weight_override = regularization.get('depth_weight', None)
-
-    # 如果去噪配置中指定了深度权重，使用配置值
-    if depth_weight_override is not None and depth_weight_override > 0:
-        enable_depth_reg = True
-        depth_reg_weight = depth_weight_override
+    # 两种全局约束分别记录，默认关闭会收缩几何的全局位置方差惩罚。
+    position_weight = regularization.get("position_variance_weight", 0.0)
+    scale_weight = regularization.get("scale_variance_weight", regularization.get("smoothness_weight", 0.0))
 
     enable_antialiasing = denoise_config.get('antialiasing', True)
 
     scene = ColmapScene(dataset_dir, factor=downsample)
-    dataset = ColmapDataset(scene)
+    cache_bytes = options.get("image_cache_mb", 256) * 1024**2
+    dataset = ColmapDataset(scene, cache_bytes=cache_bytes, uint8_images=True)
 
-    params = _init_gaussians(scene.points, scene.points_rgb, sh_degree, device)
+    initial_indices = np.arange(len(scene.points))
+    if len(initial_indices) > cap_max:
+        initial_indices = np.random.choice(initial_indices, cap_max, replace=False)
+    params = _init_gaussians(scene.points[initial_indices], scene.points_rgb[initial_indices], sh_degree, device)
 
-    lr_means = 1.6e-4 * scene.scene_scale
+    lr_means = options.get("position_lr", 1.6e-4) * scene.scene_scale
     optimizers = {
         "means": torch.optim.Adam([params["means"]], lr=lr_means, eps=1e-15),
         "scales": torch.optim.Adam([params["scales"]], lr=5e-3, eps=1e-15),
@@ -142,20 +143,52 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         optimizers["means"], gamma=0.01 ** (1.0 / iterations)
     )
 
-    # MCMC 策略优化：减少杂点生成
-    strategy = MCMCStrategy(
-        cap_max=cap_max,
-        refine_start_iter=500,
-        refine_stop_iter=int(iterations * 0.5),  # 从 0.6 改为 0.5，提前停止细化
-        refine_every=100,
-        min_opacity=0.01,  # 从 0.005 提高到 0.01，过滤低不透明度点
-        verbose=False,
-    )
+    strategy_name = options.get("strategy", "mcmc")
+    strategy_options = {"refine_start_iter": 500,
+                        "refine_stop_iter": int(iterations * options.get("refine_stop_ratio", 0.5)),
+                        "refine_every": options.get("densify_interval", 100), "verbose": False}
+    if strategy_name == "default":
+        strategy_type = DefaultStrategy
+        if options.get("fix_opacity_reset", False):
+            from app.strategy_compat import DefaultStrategyWithOpacityReset
+            strategy_type = DefaultStrategyWithOpacityReset
+        strategy = strategy_type(**strategy_options, reset_every=options.get("opacity_reset_interval", 3000))
+    elif strategy_name == "mcmc":
+        strategy = MCMCStrategy(**strategy_options, cap_max=cap_max, min_opacity=opacity_threshold)
+    else:
+        raise ValueError(f"不支持的训练策略：{strategy_name}")
     strategy.check_sanity(params, optimizers)
-    strategy_state = strategy.initialize_state()
+    strategy_state = strategy.initialize_state(scene_scale=scene.scene_scale) if strategy_name == "default" else strategy.initialize_state()
 
     ssim_fn = SSIM(data_range=1.0, size_average=True, channel=3)
     n_images = len(dataset)
+    stride = options.get("validation_every", 0)
+    validation_indices = list(range(stride - 1, n_images, stride)) if stride else []
+    if options.get("validation_names") is not None:
+        # 独立重建协议按文件名固定划分，避免注册顺序变化使验证图进入训练。
+        requested_names = set(options["validation_names"])
+        unknown = requested_names - set(scene.names)
+        if unknown:
+            raise ValueError(f"验证视角未成功定位：{sorted(unknown)}")
+        validation_indices = [index for index, name in enumerate(scene.names) if name in requested_names]
+    validation_set = set(validation_indices)
+    train_indices = [index for index in range(n_images) if index not in validation_set]
+    if len(train_indices) < 2:
+        raise ValueError("留出验证视角后至少需要两张训练图像")
+    effective = {
+        "iterations": iterations, "downsample": downsample, "cap_max": cap_max,
+        "training": {**options, "strategy": strategy_name, "seed": seed, "sh_degree": sh_degree,
+                     "position_lr": lr_means, **strategy_options},
+        "denoise": denoise_config, "depth_enabled": bool(scene.has_depth and enable_depth_reg),
+        "depth_reg_weight": depth_reg_weight, "pose_opt_enabled": enable_pose_opt,
+        "antialiased": enable_antialiasing, "image_dimensions": scene.dimensions,
+        "image_cache_mb": cache_bytes // 1024**2, "cached_image_dtype": "uint8",
+        "train_indices": train_indices, "validation_indices": validation_indices,
+        "validation_scope": options.get("validation_scope", "仅留出颜色监督；相机重建和初始点云可能使用全部输入，不能称为完全未见视角"),
+        "strategy_implementation": type(strategy).__name__,
+    }
+    with open(os.path.join(out_dir, "effective_config.json"), "w", encoding="utf-8") as output:
+        json.dump(effective, output, ensure_ascii=False, indent=2)
     t0 = time.time()
     last_loss = 0.0
 
@@ -173,9 +206,18 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         pose_optimizer = torch.optim.Adam(poses.parameters(), lr=pose_opt_lr)
         print(f"位姿优化已启用: start={pose_opt_start}, lr={pose_opt_lr}")
 
+    monitor = None
+    if options.get("checkpoint_every", 0):
+        if poses is not None:
+            raise ValueError("阶段监控暂不支持位姿微调，请使用固定相机对照")
+        from app.training_monitor import StageMonitor
+        monitor = StageMonitor(out_dir, dataset, validation_indices, options["checkpoint_every"],
+                               sh_degree, enable_antialiasing, options.get("monitor_roi_path"))
+
     for step in range(iterations):
-        data = dataset[np.random.randint(n_images)]
-        image = data["image"].to(device)                       # [3,H,W]
+        data = dataset[int(np.random.choice(train_indices))]
+        # 有界八位缓存减少重复解码，显卡端转浮点避免每一步在 CPU 分配整张浮点图。
+        image = data["image"].to(device=device, dtype=torch.float32, non_blocking=True).div_(255.0)
         H, W = image.shape[1], image.shape[2]
 
         # 获取位姿（可学习 or 固定）
@@ -211,6 +253,8 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
             rasterize_mode="antialiased" if enable_antialiasing else "classic",
             render_mode=render_mode,
         )
+        # 原版增密策略需要在反向传播前保留屏幕空间梯度。
+        strategy.step_pre_backward(params, optimizers, strategy_state, step, info)
 
         # 处理渲染输出
         # gsplat 实际返回: renders[0] shape [H, W, X]
@@ -247,19 +291,14 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
 
         # 平滑正则化 loss（去噪配置）
         smoothness_loss_val = 0.0
-        if enable_denoising and smoothness_weight > 0:
-            # 计算相邻高斯点的位置和尺度差异
-            means = params["means"]
-            scales = torch.exp(params["scales"])
-
-            # 简单实现：计算均值方差作为平滑度指标
-            # 更复杂的实现可以使用 KNN 或空间哈希
-            mean_var = torch.var(means, dim=0).mean()
-            scale_var = torch.var(scales, dim=0).mean()
-            smoothness_loss_val = mean_var + scale_var
+        if enable_denoising and (position_weight > 0 or scale_weight > 0):
+            if position_weight > 0:
+                smoothness_loss_val += position_weight * torch.var(params["means"], dim=0).mean()
+            if scale_weight > 0:
+                smoothness_loss_val += scale_weight * torch.var(params["scales"].exp(), dim=0).mean()
 
         # 总loss
-        loss = photo_loss + depth_weight * depth_loss_val + pose_reg_loss_val + smoothness_weight * smoothness_loss_val
+        loss = photo_loss + depth_weight * depth_loss_val + pose_reg_loss_val + smoothness_loss_val
         loss.backward()
         last_loss = loss.item()
 
@@ -269,6 +308,16 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
                 for param in param_group.param_groups[0]['params']:
                     if param.grad is not None:
                         torch.nn.utils.clip_grad_norm_([param], max_grad_norm)
+
+        if strategy_name == "default":
+            # 原版策略先根据本次反向传播增密，再让优化器更新变换后的参数和状态。
+            strategy.step_post_backward(params, optimizers, strategy_state, step, info, packed=True)
+            if len(params["means"]) > cap_max:
+                from gsplat.strategy.ops import remove
+                keep = torch.topk(params["opacities"].detach(), cap_max).indices
+                remove_mask = torch.ones(len(params["means"]), dtype=torch.bool, device=device)
+                remove_mask[keep] = False
+                remove(params, optimizers, strategy_state, remove_mask)
 
         # 更新高斯参数
         for opt in optimizers.values():
@@ -281,10 +330,16 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
             pose_optimizer.step()
             pose_optimizer.zero_grad(set_to_none=True)
 
-        strategy.step_post_backward(
-            params, optimizers, strategy_state, step, info,
-            lr=scheduler.get_last_lr()[0],
-        )
+        if strategy_name == "mcmc":
+            strategy.step_post_backward(params, optimizers, strategy_state, step, info,
+                                        lr=scheduler.get_last_lr()[0])
+
+        # 用已完成步数命名阶段；策略仍使用从零开始的步号，避免增密时程偏移。
+        if monitor is not None and monitor.due(step + 1, iterations):
+            stage = monitor.record(params, step + 1, scheduler.get_last_lr()[0], sh_degree_now)
+            progress_cb(step + 1, iterations,
+                        f"阶段 {step + 1} 验证全图PSNR={stage['full_psnr']:.4f} "
+                        f"主体PSNR={stage.get('subject_psnr', float('nan')):.4f}")
 
         if step % 200 == 0 or step == iterations - 1:
             progress_cb(step, iterations,
@@ -300,22 +355,50 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         optimized_poses = poses.get_all_poses().detach().cpu().numpy()
         np.save(os.path.join(out_dir, "optimized_poses.npy"), optimized_poses)
         print(f"已保存优化后的位姿: {optimized_poses.shape}")
+        scene.camtoworlds = optimized_poses
+        dataset = ColmapDataset(scene, cache_bytes=cache_bytes, uint8_images=True)
 
     from app.export import export_gaussians
     # 统计交付模型实际包含的点数，避免清理前的数量误导质量判断。
     exported_count = export_gaussians(params, out_dir, auto_cleanup=auto_cleanup,
                                       cleanup_threshold=cleanup_threshold, denoise_config=denoise_config)
+    training_seconds = time.time() - t0
+    # 评估另读交付模型前释放优化器，避免同时保留两份模型及其动量占满显存。
+    del params, optimizers, scheduler, strategy, strategy_state, loss, renders, info, colors
+    torch.cuda.empty_cache()
+
+    # 导出模型用相同相机和尺寸评估；训练重建与留出颜色监督分别标记。
+    from app.evaluation import evaluate_views, load_ply_params
+    evaluated_params = load_ply_params(os.path.join(out_dir, "point_cloud.ply"))
+    preview_indices = np.linspace(0, len(train_indices) - 1, min(6, len(train_indices)), dtype=int)
+    evaluation = evaluate_views(evaluated_params, dataset, os.path.join(out_dir, "evaluation", "training"),
+                                indices=[train_indices[index] for index in preview_indices],
+                                antialiased=enable_antialiasing)
+    validation = None
+    if validation_indices:
+        validation = evaluate_views(evaluated_params, dataset, os.path.join(out_dir, "evaluation", "validation"),
+                                    indices=validation_indices, split="heldout_rgb_supervision",
+                                    antialiased=enable_antialiasing)
 
     stats = {
         "iterations": iterations,
         "num_gaussians": exported_count,
         "num_gaussians_before_cleanup": num_gs,
         "final_loss": round(last_loss, 5),
-        "train_seconds": round(time.time() - t0, 1),
+        "train_seconds": round(training_seconds, 1),
         "peak_gpu_mem_gb": round(mem_gb, 2),
         "n_images": n_images,
         "downsample": downsample,
+        "seed": seed, "strategy": strategy_name, "sh_degree": sh_degree,
+        "image_dimensions": scene.dimensions, "n_training_images": len(train_indices),
+        "n_validation_images": len(validation_indices), "antialiased": enable_antialiasing,
+        "evaluation": evaluation["averages"],
+        "validation": validation["averages"] if validation else None,
     }
-    with open(os.path.join(out_dir, "train_stats.json"), "w") as f:
+    if monitor is not None:
+        stats["monitoring"] = {"history": "stage_history.json", "best_stage": monitor.records and
+                               json.loads((monitor.root / "best_stage.json").read_text(encoding="utf-8")),
+                               "seconds_included_in_train_seconds": round(monitor.seconds, 3)}
+    with open(os.path.join(out_dir, "train_stats.json"), "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2, ensure_ascii=False)
     return stats

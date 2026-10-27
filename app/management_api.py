@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from app import config
 from app.celery_app import celery_app
+from app.training_config import generate_training_config, save_training_config
 from app.object_capture import (
     IMAGE_EXTENSIONS, MAX_OBJECT_INPUTS, MIN_OBJECT_IMAGES,
     extract_photo_archive, prepare_object_views,
@@ -128,6 +129,17 @@ def _model_record_from_task(task_id: str) -> Optional[dict]:
         stats = {}
 
     params = status.get("params", {})
+    dimensions = stats.get("image_dimensions", [])
+    if not dimensions:
+        # 旧模型没有记录尺寸时读取一张实际训练图，避免继续只显示倍数。
+        from PIL import Image
+        image_dir = os.path.join(TASKS_DIR, task_id, "dataset", f"images_{stats.get('downsample', params.get('downsample', 1))}")
+        if os.path.isdir(image_dir):
+            for name in sorted(os.listdir(image_dir)):
+                if os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS:
+                    with Image.open(os.path.join(image_dir, name)) as image:
+                        dimensions = [{"width": image.width, "height": image.height}]
+                    break
     return {
         "id": task_id,
         "name": status.get("model_name") or status.get("modelName") or task_id,
@@ -140,6 +152,12 @@ def _model_record_from_task(task_id: str) -> Optional[dict]:
         "pointCount": os.path.getsize(splat_path) // 32,
         "path": model_path,
         "taskId": task_id,
+        "trainingSize": dimensions[:1],
+        "evaluation": stats.get("evaluation"), "validation": stats.get("validation"),
+        # PLY 保留球谐颜色；旧服务没有此字段时前端继续使用固定颜色格式。
+        "displayFormats": ["splat", "ply"], "viewerMaxShDegree": min(stats.get("sh_degree", 3), 2),
+        "antialiased": stats.get("antialiased", True),
+        "hasRawModel": os.path.isfile(os.path.join(TASKS_DIR, task_id, "output", "point_cloud_raw.ply")),
     }
 
 
@@ -168,9 +186,8 @@ def _training_views(task_id: str) -> list[dict]:
         reconstruction = pycolmap.Reconstruction(sparse_dir)
         ordered_images = sorted(reconstruction.images.values(), key=lambda item: item.name)
         positions = np.stack([image.cam_from_world().inverse().translation for image in ordered_images])
-        center = positions.mean(axis=0)
-        max_dist = np.linalg.norm(positions - center, axis=1).max()
-        scene_scale = 1.0 / (max_dist * 1.05) if max_dist > 1e-6 else 1.0
+        from app.camera_geometry import camera_normalization
+        center, scene_scale = camera_normalization(positions, os.path.join(TASKS_DIR, task_id, "dataset"))
         views = []
         for image in ordered_images:
             camera_to_world = image.cam_from_world().inverse()
@@ -185,6 +202,7 @@ def _training_views(task_id: str) -> list[dict]:
                 "forward": rotation[:, 2].tolist(),
                 "up": (-rotation[:, 1]).tolist(),
                 "fov": max(25.0, min(95.0, fov)),
+                "aspect": camera.width / camera.height,
             })
         return views
     except Exception:
@@ -393,6 +411,8 @@ async def extract_video_frames(video_path: str, output_dir: str, video_config: d
         effective_duration = duration - start_time
     if effective_duration <= 0:
         raise ValueError("视频抽帧时间范围无效，或无法读取视频时长")
+    if not 1 <= int(total_frames) <= config.MAX_IMAGES or fps <= 0 or interval <= 0:
+        raise ValueError("抽帧数量或频率无效")
 
     quality_map = {'low': 5, 'medium': 2, 'high': 1}
     q_value = quality_map.get(quality, 2)
@@ -470,14 +490,24 @@ async def extract_video_frames(video_path: str, output_dir: str, video_config: d
         for frame_name in selected_frames:
             shutil.copy2(os.path.join(selected_dir, frame_name), os.path.join(output_dir, frame_name))
 
-        return {
+        rate = fps if mode == "fps" else (1 / interval if mode == "interval" else total_frames / effective_duration)
+        manifest = {
             'initial_frames': initial_count,
             'valid_frames': len(selected_frames),
             'filtered_frames': filter_result['valid_frames'],
             'removed_blur': 0 if fallback_used else filter_result['removed_blur'],
             'removed_duplicate': 0 if fallback_used else filter_result['removed_duplicate'],
             'fallback_used': fallback_used,
+            "video": video_info, "sampling_rate": rate,
+            "frames": [{"name": name, "source_index": int(os.path.splitext(name)[0].split("_")[-1]) - 1,
+                        "timestamp_seconds": round(min(start_time + effective_duration,
+                            start_time + (int(os.path.splitext(name)[0].split("_")[-1]) - 0.5) / rate), 4)}
+                       for name in selected_frames],
         }
+        # 时间戳为均匀帧率采样的中心时刻估计，不冒充精确原视频时间戳。
+        manifest["timestamp_kind"] = "uniform_sampling_estimate"
+        save_training_config(output_dir, manifest, "frame_manifest.json")
+        return manifest
     except Exception as e:
         raise Exception(f"视频抽帧失败: {str(e)}")
     finally:
@@ -510,17 +540,28 @@ async def generate_3dgs(
     except (ValueError, TypeError, json.JSONDecodeError):
         raise HTTPException(status_code=400, detail="配置格式无效")
 
+    try:
+        config_dict["sceneType"] = sceneType
+        prepared_config = generate_training_config(config_dict, scene_type=sceneType)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
     object_quick = sceneType == "object" and config_dict.get("objectQuick") is True
+    object_high = sceneType == "object" and config_dict.get("qualityMode") == "high"
+    object_mode = object_quick or object_high
+    if object_high:
+        object_quick = False
     square_crop = config_dict.get("objectSquareCrop", True)
-    target_views = config_dict.get("objectTargetViews", 12)
-    if object_quick and (not isinstance(square_crop, bool) or type(target_views) is not int
-                         or not MIN_OBJECT_IMAGES <= target_views <= 15):
+    target_views = config_dict.get("objectTargetViews", 60 if object_high else 12)
+    minimum_views, maximum_views = (config.MIN_IMAGES, 200) if object_high else (MIN_OBJECT_IMAGES, 15)
+    if object_mode and (not isinstance(square_crop, bool) or type(target_views) is not int
+                         or not minimum_views <= target_views <= maximum_views):
         raise HTTPException(status_code=400, detail="单物体裁切或视角数量参数无效")
     photo_uploads = images or []
     if photo_uploads:
-        if not object_quick or file is not None or is_video:
-            raise HTTPException(status_code=400, detail="多张照片仅支持单物体快速重建，不能与视频或 ZIP 混传")
-        if not MIN_OBJECT_IMAGES <= len(photo_uploads) <= MAX_OBJECT_INPUTS:
+        if not object_mode or file is not None or is_video:
+            raise HTTPException(status_code=400, detail="多张照片仅支持单物体重建，不能与视频或 ZIP 混传")
+        if not minimum_views <= len(photo_uploads) <= MAX_OBJECT_INPUTS:
             raise HTTPException(status_code=400, detail=f"单物体照片需 {MIN_OBJECT_IMAGES}-{MAX_OBJECT_INPUTS} 张")
         if any(os.path.splitext(photo.filename or "")[1].lower() not in IMAGE_EXTENSIONS for photo in photo_uploads):
             raise HTTPException(status_code=400, detail="包含不支持的照片格式")
@@ -536,12 +577,15 @@ async def generate_3dgs(
         if not file.filename.lower().endswith('.zip'):
             raise HTTPException(status_code=400, detail="只支持 ZIP 文件")
         # 快速模式先自行选图，避免训练器再次从原始 ZIP 解压覆盖已选图像。
-        input_name = "input_photos.zip" if object_quick else "input.zip"
+        input_name = "input_photos.zip" if object_mode else "input.zip"
 
     if not 500 <= iterations <= config.MAX_ITERATIONS or resolution not in (1, 2, 4, 8):
         raise HTTPException(status_code=400, detail="训练迭代或分辨率参数无效")
     task_dir = _task_dir(task_id)
     os.makedirs(task_dir, exist_ok=False)
+    # 请求原文与规范化配置分别保留，便于核对界面字段和最终生效值。
+    save_training_config(task_dir, config_dict, "requested_config.json")
+    save_training_config(task_dir, prepared_config)
     input_path = os.path.join(task_dir, input_name)
     try:
         if photo_uploads:
@@ -555,9 +599,9 @@ async def generate_3dgs(
         else:
             with open(input_path, "wb") as output:
                 shutil.copyfileobj(file.file, output, length=4 * 1024 * 1024)
-            if object_quick and not is_video:
+            if object_mode and not is_video:
                 count = _count_zip_images(input_path)
-                if not MIN_OBJECT_IMAGES <= count <= MAX_OBJECT_INPUTS:
+                if not minimum_views <= count <= MAX_OBJECT_INPUTS:
                     raise HTTPException(status_code=400, detail=f"单物体 ZIP 需 {MIN_OBJECT_IMAGES}-{MAX_OBJECT_INPUTS} 张照片，当前 {count} 张")
                 message = f"已接收 {count} 张单物体照片"
             else:
@@ -615,7 +659,8 @@ async def process_generation_task(
     """准备训练输入，再提交已有的 GPU 训练任务。"""
 
     try:
-        if object_quick:
+        object_high = generation_config.get("qualityMode") == "high" and generation_config.get("sceneType", "object") == "object"
+        if object_quick or object_high:
             task_dir = _task_dir(task_id)
             raw_dir = os.path.join(task_dir, "raw_images")
             image_dir = os.path.join(task_dir, "images")
@@ -623,18 +668,30 @@ async def process_generation_task(
             if is_video:
                 _append_task_log(task_id, "开始均匀抽取单物体视频视角")
                 # 先均匀取样，再按拍摄顺序分段选清晰帧，兼顾画质和环绕覆盖。
-                quick_video = {"extractionMode": "count", "totalFrames": 80, "quality": "high",
+                candidate_count = min(config.MAX_IMAGES, max(120, target_views * 3)) if object_high else 80
+                quick_video = {"extractionMode": "count", "totalFrames": candidate_count, "quality": "high",
                                "removeBlurry": False, "removeDuplicates": False,
                                "startTime": video_config.get("startTime", 0),
                                "endTime": video_config.get("endTime", 0)}
-                await extract_video_frames(file_path, raw_dir, quick_video)
+                candidate_result = await extract_video_frames(file_path, raw_dir, quick_video)
             elif not direct_photos:
                 _append_task_log(task_id, "开始解压单物体照片")
                 await asyncio.to_thread(extract_photo_archive, file_path, raw_dir)
             # 解压和逐张解码会占用 CPU，放到线程中避免阻塞 API 的其他请求。
-            result = await asyncio.to_thread(prepare_object_views, raw_dir, image_dir, target_views, square_crop)
+            result = await asyncio.to_thread(prepare_object_views, raw_dir, image_dir, target_views, square_crop,
+                                            200 if object_high else 15)
             frame_count = result["selected_count"]
-            sfm_backend = "mast3r"
+            if object_high and frame_count < config.MIN_IMAGES:
+                raise ValueError("高质量重建至少需要 20 张有效视角")
+            if is_video:
+                timestamps = {frame["name"]: frame["timestamp_seconds"] for frame in candidate_result["frames"]}
+                for frame in result["frames"]:
+                    frame["timestamp_seconds"] = timestamps.get(frame["source"])
+                result["timestamp_kind"] = candidate_result["timestamp_kind"]
+            save_training_config(task_dir, result, "frame_manifest.json")
+            if result.get("duplicate_fallback_indices"):
+                _append_task_log(task_id, f"有 {len(result['duplicate_fallback_indices'])} 个时间段缺少变化视角，已记录选帧回退")
+            sfm_backend = "colmap" if object_high else "mast3r"
             _append_task_log(task_id, f"单物体选图完成：输入 {result['input_count']} 张，选出 {frame_count} 张，主体清晰度中位数 {result['median_focus']}")
         elif is_video:
             _append_task_log(task_id, "开始视频抽帧")
@@ -642,6 +699,7 @@ async def process_generation_task(
             image_dir = os.path.join(_task_dir(task_id), "images")
             frame_result = await extract_video_frames(file_path, image_dir, video_config)
             frame_count = frame_result["valid_frames"]
+            save_training_config(_task_dir(task_id), frame_result, "frame_manifest.json")
             if frame_result["fallback_used"]:
                 _append_task_log(task_id, "质量过滤后帧数不足，已保留原始抽帧以继续重建")
             _append_task_log(task_id, f"视频抽帧完成：原始 {frame_result['initial_frames']} 帧，有效 {frame_count} 帧")
@@ -656,12 +714,12 @@ async def process_generation_task(
         advanced = generation_config.get("advanced", {})
         if not isinstance(advanced, dict):
             advanced = {}
-        # 前端配置中的实验选项只传递训练器已实现的参数。
-        # 快速预览不启用实验性深度约束，降低 8GB 显卡的耗时和显存占用。
-        enable_depth_reg = False if object_quick else bool(advanced.get("depthRegularization", False))
+        normalized = generate_training_config(generation_config, scene_type=generation_config.get("sceneType", "outdoor"))
+        save_training_config(_task_dir(task_id), normalized)
+        enable_depth_reg = normalized["depth"]["enable"]
         params = {
             "iterations": iterations, "downsample": resolution,
-            "cap_max": config.DEFAULT_CAP_MAX, "sfm_backend": sfm_backend,
+            "cap_max": normalized["training"]["cap_max"], "sfm_backend": sfm_backend,
         }
         _append_task_log(task_id, f"已提交真实训练：{sfm_backend}，{frame_count} 张图像，{iterations} 次迭代")
         _update_task_status(task_id, status="queued", stage="queued", progress=0.0, params=params)
@@ -670,9 +728,10 @@ async def process_generation_task(
             kwargs={
                 "iterations": iterations,
                 "downsample": resolution,
-                "cap_max": config.DEFAULT_CAP_MAX,
+                "cap_max": normalized["training"]["cap_max"],
                 "sfm_backend": sfm_backend,
                 "enable_depth_reg": enable_depth_reg,
+                "depth_reg_weight": normalized["depth"]["weight"],
             },
             task_id=task_id, queue=config.QUEUE_NAME,
         )
@@ -743,6 +802,18 @@ async def get_model_splat(modelId: str):
     if not os.path.isfile(splat_path) or os.path.getsize(splat_path) == 0:
         raise HTTPException(status_code=404, detail="模型查看文件不存在")
     return FileResponse(splat_path, media_type="application/octet-stream")
+
+
+@router.get("/model/{modelId}/point_cloud.ply")
+async def get_model_ply(modelId: str, raw: bool = False):
+    """提供保留球谐颜色的模型，历史模型仍可走原有固定颜色入口。"""
+    model = _find_model(modelId)
+    if model is None:
+        raise HTTPException(status_code=404, detail="模型不存在")
+    path = os.path.join(os.path.dirname(model["path"]), "point_cloud_raw.ply" if raw else "point_cloud.ply")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="此任务未保留清理前模型")
+    return FileResponse(path, media_type="application/octet-stream")
 
 
 @router.delete("/model/{modelId}")

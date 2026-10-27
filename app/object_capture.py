@@ -11,7 +11,7 @@ from PIL import Image, ImageOps
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 MIN_OBJECT_IMAGES = 8
-MAX_OBJECT_INPUTS = 200
+MAX_OBJECT_INPUTS = 500
 MAX_OBJECT_VIEWS = 15
 
 
@@ -38,7 +38,7 @@ def extract_photo_archive(archive_path: str, output_dir: str) -> list[str]:
     return paths
 
 
-def _focus_score(path: str, square_crop: bool) -> float:
+def _focus_details(path: str, square_crop: bool):
     """只对缩小的主体区域计算清晰度，减少远处背景对选帧的干扰。"""
     with Image.open(path) as source:
         image = ImageOps.exif_transpose(source).convert("L")
@@ -53,11 +53,16 @@ def _focus_score(path: str, square_crop: bool) -> float:
         raise ValueError(f"图片分辨率过低：{os.path.basename(path)}")
     height, width = gray.shape
     roi = gray[height // 5:height * 4 // 5, width // 5:width * 4 // 5]
-    return float(cv2.Laplacian(roi, cv2.CV_64F).var())
+    return float(cv2.Laplacian(roi, cv2.CV_64F).var()), cv2.resize(roi, (64, 64), interpolation=cv2.INTER_AREA)
+
+
+def _focus_score(path: str, square_crop: bool) -> float:
+    """保持旧评分接口，选帧流程同时复用缩略图判断近乎相同的画面。"""
+    return _focus_details(path, square_crop)[0]
 
 
 def prepare_object_views(source_dir: str, output_dir: str, target_views: int = 12,
-                         square_crop: bool = True) -> dict:
+                         square_crop: bool = True, max_views: int = MAX_OBJECT_VIEWS) -> dict:
     """按拍摄顺序分段选图；每段取主体最清晰的一张，保留环绕视角覆盖。"""
     files = sorted(
         str(path) for path in Path(source_dir).iterdir()
@@ -65,11 +70,22 @@ def prepare_object_views(source_dir: str, output_dir: str, target_views: int = 1
     )
     if not MIN_OBJECT_IMAGES <= len(files) <= MAX_OBJECT_INPUTS:
         raise ValueError(f"单物体输入需 {MIN_OBJECT_IMAGES}-{MAX_OBJECT_INPUTS} 张，当前 {len(files)} 张")
-    count = min(max(int(target_views), MIN_OBJECT_IMAGES), MAX_OBJECT_VIEWS, len(files))
-    scores = [_focus_score(path, square_crop) for path in files]
+    count = min(max(int(target_views), MIN_OBJECT_IMAGES), max_views, len(files))
+    details = [_focus_details(path, square_crop) for path in files]
+    scores = [item[0] for item in details]
     selected = []
+    duplicate_fallbacks = []
     for bucket in np.array_split(np.arange(len(files)), count):
-        best = max(bucket, key=lambda index: scores[int(index)])
+        ranked = sorted((int(index) for index in bucket), key=lambda index: scores[index], reverse=True)
+        best = ranked[0]
+        if selected:
+            # 只排除近乎逐像素相同的候选，避免把正常的高重叠相邻视角误删。
+            alternatives = [index for index in ranked if float(np.abs(
+                details[index][1].astype(np.float32) - details[selected[-1]][1]).mean()) >= 0.5]
+            if alternatives:
+                best = alternatives[0]
+            else:
+                duplicate_fallbacks.append(len(selected))
         selected.append(int(best))
 
     os.makedirs(output_dir, exist_ok=True)
@@ -87,4 +103,9 @@ def prepare_object_views(source_dir: str, output_dir: str, target_views: int = 1
         "selected_count": len(selected),
         "median_focus": round(float(np.median([scores[index] for index in selected])), 1),
         "selected_names": [os.path.basename(files[index]) for index in selected],
+        "selection_method": "temporal_buckets_focus_and_near_duplicate_check",
+        "duplicate_fallback_indices": duplicate_fallbacks,
+        "frames": [{"name": f"frame_{order:04d}.jpg", "source": os.path.basename(files[index]),
+                    "source_index": index, "focus_score": round(scores[index], 3)}
+                   for order, index in enumerate(selected, start=1)],
     }
