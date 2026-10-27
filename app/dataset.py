@@ -7,6 +7,8 @@
 """
 
 import os
+import hashlib
+import io
 from collections import OrderedDict
 
 import numpy as np
@@ -112,9 +114,19 @@ class ColmapScene:
 
 
 class ColmapDataset(Dataset):
-    def __init__(self, scene: ColmapScene, cache_bytes: int = 64 * 1024**2, uint8_images=False):
+    def __init__(self, scene: ColmapScene, cache_bytes: int = 64 * 1024**2,
+                 uint8_images=False, mask_dir=None, allow_unreviewed_masks=False):
         self.scene = scene
         self.uint8_images = uint8_images
+        self.mask_dir = os.path.abspath(mask_dir) if mask_dir else None
+        if self.mask_dir and not os.path.isdir(self.mask_dir):
+            raise ValueError(f"主体掩码目录不存在：{self.mask_dir}")
+        self.mask_paths, self.mask_report = {}, None
+        if self.mask_dir:
+            from app.subject_masks import validate_mask_set
+            self.mask_paths, self.mask_report = validate_mask_set(scene, self.mask_dir, allow_unreviewed_masks)
+        self.mask_fingerprints = {record["name"]: record["mask_sha256"] for record in
+                                  (self.mask_report["frames"] if self.mask_report else [])}
         # 有界缓存减少随机训练反复解码，避免高分辨率数据全部常驻内存。
         self.cache_bytes = cache_bytes
         self._cache = OrderedDict()
@@ -141,6 +153,19 @@ class ColmapDataset(Dataset):
             "K": torch.from_numpy(self.scene.Ks[idx]),
             "image_id": idx,
         }
+
+        if self.mask_dir:
+            # 掩码只作为可选实验输入；缺少任一帧时直接失败，避免静默退回无掩码训练。
+            mask_path = self.mask_paths[self.scene.names[idx]]
+            with open(mask_path, "rb") as mask_source:
+                mask_content = mask_source.read()
+            if hashlib.sha256(mask_content).hexdigest() != self.mask_fingerprints[self.scene.names[idx]]:
+                raise ValueError(f"训练开始后主体掩码发生变化：{self.scene.names[idx]}")
+            with Image.open(io.BytesIO(mask_content)) as mask_image:
+                mask = np.array(mask_image.convert("L"), dtype=np.uint8)
+            if mask.shape != (self.scene.dimensions[idx]["height"], self.scene.dimensions[idx]["width"]):
+                raise ValueError(f"主体掩码尺寸不匹配：{self.scene.names[idx]}")
+            data["mask"] = torch.from_numpy(mask).contiguous()
 
         # 加载深度图（如果存在）
         if self.scene.has_depth:

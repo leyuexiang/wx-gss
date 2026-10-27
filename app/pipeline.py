@@ -479,7 +479,7 @@ def run_pipeline(task_id: str, iterations: int, downsample: int, cap_max: int, s
     result_zip = os.path.join(out_dir, "result.zip")
     with zipfile.ZipFile(result_zip, "w", zipfile.ZIP_DEFLATED) as zf:
         for name in ("point_cloud.ply", "point_cloud.splat", "train_stats.json", "effective_config.json", "cleanup_report.json",
-                     "stage_history.json", "best_stage.json", "monitor_reference_roi.json"):
+                     "stage_history.json", "best_stage.json", "monitor_reference_roi.json", "mask_validation.json"):
             p = os.path.join(out_dir, name)
             if os.path.exists(p):
                 zf.write(p, name)

@@ -32,6 +32,7 @@ def main():
         experiments[label] = {"root": str(root), "complete": complete,
                               "refine_stop_iter": effective["training"]["refine_stop_iter"],
                               "opacity_reset_fixed": effective["training"].get("fix_opacity_reset", False),
+                              "mask_loss": effective.get("mask_loss"),
                               "selection_metric": history["selection_metric"],
                               "best_stage": history["best_stage"], "last_stage": rows[-1],
                               "records": rows}
@@ -59,11 +60,9 @@ def main():
     for axis, metric, title in zip(axes.flat,
             ["subject_psnr", "full_psnr", "subject_ssim", "point_count"],
             ["Subject PSNR (dB)", "Full-frame PSNR (dB)", "Subject SSIM", "Gaussian count"]):
-        for data in experiments.values():
+        for label, data in experiments.items():
             rows = [row for row in data["records"] if metric in row]
-            label = f"Stop at {data['refine_stop_iter']}"
-            if data["opacity_reset_fixed"]:
-                label += ", reset fixed"
+            # 使用输入标签区分方案；掩码对照的增密停止步号相同，不能只按步号命名。
             line, = axis.plot([row["completed_steps"] for row in rows],
                               [row[metric] for row in rows], marker=".", label=label)
             axis.axvline(data["refine_stop_iter"], color=line.get_color(), alpha=.35, linestyle="--")

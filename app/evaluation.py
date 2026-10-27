@@ -128,6 +128,15 @@ def evaluate_views(params: dict, dataset, output_dir: str, indices=None,
                 record["subject"] = {"roi": subject_box, **_image_metrics(
                     prediction[:, y:y + crop_height, x:x + crop_width],
                     target[:, y:y + crop_height, x:x + crop_width])}
+                # 矩形外像素单独计算误差，避免主体变好掩盖背景回退；不将其当作漂浮点数量。
+                background = torch.ones((height, width), dtype=torch.bool, device=device)
+                background[y:y + crop_height, x:x + crop_width] = False
+                if background.any():
+                    squared_error = (prediction - target).square().mean(dim=0)
+                    mse = squared_error[background].mean().item()
+                    record["background"] = {"region": "outside_subject_rectangle",
+                                            "pixels": int(background.sum()), "mse": mse,
+                                            "psnr": float(-10 * math.log10(max(mse, 1e-12)))}
             records.append(record)
             if not save_images:
                 continue
@@ -162,5 +171,11 @@ def evaluate_views(params: dict, dataset, output_dir: str, indices=None,
                                    if record["sh_degree"] == degree]))
             for metric in ("psnr", "ssim")
         } for degree in degrees}
+        background_records = [record for record in records if "background" in record]
+        result["background_averages"] = {str(degree): {
+            metric: float(np.mean([record["background"][metric] for record in background_records
+                                   if record["sh_degree"] == degree]))
+            for metric in ("mse", "psnr")
+        } for degree in degrees if any(record["sh_degree"] == degree for record in background_records)}
     (output / "metrics.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result

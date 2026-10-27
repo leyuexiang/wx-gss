@@ -1,4 +1,4 @@
-"""固定已准备的数据、留出视角和训练预算，只对照增密策略。"""
+"""固定数据、留出视角和训练预算，独立对照增密策略或可选掩码权重。"""
 
 import argparse
 import json
@@ -17,6 +17,10 @@ def main():
     parser.add_argument("--refine-stop", type=int, help="固定增密停止步号，其余训练时程保持原样")
     parser.add_argument("--checkpoint-every", type=int, default=0)
     parser.add_argument("--subject-roi", help="冻结的参考图矩形及摘要文件")
+    parser.add_argument("--mask-dir", help="可选主体掩码目录；仅用于隔离实验")
+    parser.add_argument("--allow-unreviewed-masks", action="store_true", help="允许自动原型探索或合成流程检查，不代表掩码已复查")
+    parser.add_argument("--mask-foreground-weight", type=float, default=1.5)
+    parser.add_argument("--mask-background-weight", type=float, default=0.25)
     parser.add_argument("--fix-opacity-reset", action="store_true", help="单独验证已确认的依赖重置条件修正")
     args = parser.parse_args()
     from app.trainer import train
@@ -36,6 +40,11 @@ def main():
         options["checkpoint_every"] = args.checkpoint_every
     if args.subject_roi:
         options["monitor_roi_path"] = str(Path(args.subject_roi).resolve())
+    if args.mask_dir:
+        options["mask_dir"] = str(Path(args.mask_dir).resolve())
+        options["mask_foreground_weight"] = args.mask_foreground_weight
+        options["mask_background_weight"] = args.mask_background_weight
+        options["allow_unreviewed_masks"] = args.allow_unreviewed_masks
     if args.fix_opacity_reset:
         if args.strategy != "default":
             raise ValueError("不透明度重置修正仅适用于原版风格增密策略")

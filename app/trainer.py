@@ -123,7 +123,17 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
 
     scene = ColmapScene(dataset_dir, factor=downsample)
     cache_bytes = options.get("image_cache_mb", 256) * 1024**2
-    dataset = ColmapDataset(scene, cache_bytes=cache_bytes, uint8_images=True)
+    mask_dir = options.get("mask_dir")
+    allow_unreviewed_masks = options.get("allow_unreviewed_masks", False)
+    dataset = ColmapDataset(scene, cache_bytes=cache_bytes, uint8_images=True, mask_dir=mask_dir,
+                            allow_unreviewed_masks=allow_unreviewed_masks)
+    mask_foreground_weight = options.get("mask_foreground_weight", 1.5)
+    mask_background_weight = options.get("mask_background_weight", 0.25)
+    if mask_dir:
+        from app.subject_masks import validate_mask_weights, weighted_l1
+        validate_mask_weights(mask_foreground_weight, mask_background_weight)
+        from app.training_monitor import write_json_atomic
+        write_json_atomic(os.path.join(out_dir, "mask_validation.json"), dataset.mask_report)
 
     initial_indices = np.arange(len(scene.points))
     if len(initial_indices) > cap_max:
@@ -183,6 +193,12 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         "depth_reg_weight": depth_reg_weight, "pose_opt_enabled": enable_pose_opt,
         "antialiased": enable_antialiasing, "image_dimensions": scene.dimensions,
         "image_cache_mb": cache_bytes // 1024**2, "cached_image_dtype": "uint8",
+        "mask_dir": mask_dir, "mask_loss": {
+            "scope": "仅对 L1 像素误差加权，SSIM 保持全图；不是背景分割导出",
+            "manifest_sha256": dataset.mask_report["manifest_sha256"],
+            "foreground_weight": mask_foreground_weight,
+            "background_weight": mask_background_weight,
+        } if mask_dir else None,
         "train_indices": train_indices, "validation_indices": validation_indices,
         "validation_scope": options.get("validation_scope", "仅留出颜色监督；相机重建和初始点云可能使用全部输入，不能称为完全未见视角"),
         "strategy_implementation": type(strategy).__name__,
@@ -270,7 +286,12 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
             pred_rgb = rendered.permute(2, 0, 1)            # [3, H, W]
             rendered_depth = None
 
-        l1 = F.l1_loss(pred_rgb, image)
+        if mask_dir:
+            mask = data["mask"].to(device=device, dtype=torch.float32).div_(255.0)
+            # 归一化后的权重强调主体，但保持原图作为监督，不把背景涂成黑色。
+            l1 = weighted_l1(pred_rgb, image, mask, mask_foreground_weight, mask_background_weight)
+        else:
+            l1 = F.l1_loss(pred_rgb, image)
         ssim_val = ssim_fn(pred_rgb[None], image[None])
         photo_loss = 0.8 * l1 + 0.2 * (1.0 - ssim_val)
 
@@ -356,7 +377,8 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         np.save(os.path.join(out_dir, "optimized_poses.npy"), optimized_poses)
         print(f"已保存优化后的位姿: {optimized_poses.shape}")
         scene.camtoworlds = optimized_poses
-        dataset = ColmapDataset(scene, cache_bytes=cache_bytes, uint8_images=True)
+        dataset = ColmapDataset(scene, cache_bytes=cache_bytes, uint8_images=True, mask_dir=mask_dir,
+                                allow_unreviewed_masks=allow_unreviewed_masks)
 
     from app.export import export_gaussians
     # 统计交付模型实际包含的点数，避免清理前的数量误导质量判断。
@@ -378,7 +400,8 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
     if validation_indices:
         validation = evaluate_views(evaluated_params, dataset, os.path.join(out_dir, "evaluation", "validation"),
                                     indices=validation_indices, split="heldout_rgb_supervision",
-                                    antialiased=enable_antialiasing)
+                                    antialiased=enable_antialiasing,
+                                    additional_roi=monitor.regions if monitor is not None else None)
 
     stats = {
         "iterations": iterations,
@@ -396,6 +419,9 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         "validation": validation["averages"] if validation else None,
     }
     if monitor is not None:
+        if validation is not None:
+            stats["subject_validation"] = validation.get("subject_averages")
+            stats["background_validation"] = validation.get("background_averages")
         stats["monitoring"] = {"history": "stage_history.json", "best_stage": monitor.records and
                                json.loads((monitor.root / "best_stage.json").read_text(encoding="utf-8")),
                                "seconds_included_in_train_seconds": round(monitor.seconds, 3)}

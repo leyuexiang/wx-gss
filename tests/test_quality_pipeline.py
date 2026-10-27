@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -107,6 +108,8 @@ class QualityPipelineTests(unittest.TestCase):
             combined = evaluate_views(params, Dataset(), temporary, additional_roi=regions, save_images=False)
             self.assertEqual(render.call_count, 1)
             self.assertFalse(list(Path(temporary).glob("*.png")))
+            self.assertAlmostEqual(combined["background_averages"]["0"]["mse"], .01, places=6)
+            self.assertEqual(combined["records"][0]["background"]["pixels"], 24 * 24 - 12 * 13)
             cropped = evaluate_views(params, Dataset(), temporary, roi=regions, save_images=False)
             self.assertEqual(combined["subject_averages"], cropped["averages"])
 
@@ -128,6 +131,28 @@ class QualityPipelineTests(unittest.TestCase):
                 torch.testing.assert_close(sample.float() / 255.0, floating[index]["image"])
                 self.assertLessEqual(cached._cached_bytes, budget)
             self.assertNotIn(0, cached._cache)
+
+    def test_mask_cache_requires_matching_size_and_preserves_uint8(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            image_dir, mask_dir = Path(temporary) / "images", Path(temporary) / "masks"
+            image_dir.mkdir(); mask_dir.mkdir()
+            Image.new("RGB", (8, 6), (80, 90, 100)).save(image_dir / "frame_0001.jpg")
+            mask = np.zeros((6, 8), dtype=np.uint8)
+            mask[:, :4] = 255
+            Image.fromarray(mask).save(mask_dir / "frame_0001.png")
+            manifest = {"schema_version": 1, "frames": {"frame_0001.jpg": {
+                "mask": "frame_0001.png", "reviewed": True,
+                "image_sha256": hashlib.sha256((image_dir / "frame_0001.jpg").read_bytes()).hexdigest(),
+                "mask_sha256": hashlib.sha256((mask_dir / "frame_0001.png").read_bytes()).hexdigest()}}}
+            (mask_dir / "mask_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            scene = SimpleNamespace(image_dir=str(image_dir), names=["frame_0001.jpg"], n_images=1,
+                                    dimensions=[{"name": "frame_0001.jpg", "width": 8, "height": 6}],
+                                    has_depth=False, camtoworlds=np.eye(4)[None], Ks=np.eye(3)[None])
+            sample = ColmapDataset(scene, cache_bytes=1024, uint8_images=True, mask_dir=str(mask_dir))[0]
+            self.assertEqual(sample["mask"].dtype, torch.uint8)
+            Image.new("L", (7, 6), 255).save(mask_dir / "frame_0001.png")
+            with self.assertRaises(ValueError):
+                ColmapDataset(scene, cache_bytes=1024, uint8_images=True, mask_dir=str(mask_dir))[0]
 
     def test_strict_validation_rejects_geometry_or_color_leakage(self):
         import copy

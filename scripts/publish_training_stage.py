@@ -73,6 +73,8 @@ def main():
              "sh_degree": selected["evaluation_sh_degree"], "antialiased": actual["antialiased"],
              "image_dimensions": scene.dimensions, "validation": metrics["averages"],
              "subject_validation": metrics.get("subject_averages"),
+             # 候选发布后继续携带背景指标，避免交付摘要遗漏主体之外的回退。
+             "background_validation": metrics.get("background_averages"),
              "full_run_train_seconds": final_stats["train_seconds"],
              "selection_scope": history["selection_scope"],
              "monitoring": {"selected_stage": selected, "experiment": str(experiment)}}
@@ -82,7 +84,7 @@ def main():
         "scheduled_iterations": actual["iterations"], "downsample": actual["downsample"],
         "cap_max": actual["cap_max"], "sfm_backend": "colmap", "requested_config": training_config,
         "source_task": source.name, "experiment": str(experiment), "stage": selected})
-    for name in ["stage_history.json", "best_stage.json", "monitor_reference_roi.json"]:
+    for name in ["stage_history.json", "best_stage.json", "monitor_reference_roi.json", "mask_validation.json"]:
         if (experiment / name).exists():
             shutil.copy2(experiment / name, output / name)
     write_json_atomic(output / "stage_provenance.json", {"source_task": source.name,

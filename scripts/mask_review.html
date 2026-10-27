@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>茶罐主体掩码复查</title>
+<style>
+  *{box-sizing:border-box}body{margin:0;background:#f3f5f8;color:#182235;font:15px system-ui,sans-serif}
+  main{max-width:1100px;margin:auto;padding:22px}h1{font-size:24px;margin:0 0 10px}
+  p{line-height:1.6}header,.tools{background:white;padding:16px;border:1px solid #dae0e8;border-radius:10px;margin-bottom:12px}
+  .tools{display:flex;flex-wrap:wrap;gap:12px;align-items:center}button,select{font:inherit;padding:9px 13px;border:1px solid #a9b5c5;border-radius:6px;background:white;cursor:pointer}
+  button.primary{background:#125fb3;color:white;border-color:#125fb3}button:disabled{opacity:.5;cursor:default}
+  input[type=range]{width:120px}label{display:inline-flex;align-items:center;gap:5px}#status{font-weight:600}
+  #viewport{overflow:auto;max-height:calc(100vh - 330px);min-height:240px;background:#222c3a;padding:12px;border-radius:10px}
+  #picture{position:relative;isolation:isolate;max-width:none;margin:auto}#reference{display:block;width:100%;height:auto}
+  #mask{position:absolute;inset:0;width:100%;height:100%;opacity:.72;mix-blend-mode:multiply;touch-action:none;cursor:crosshair}
+  #message{min-height:24px;color:#405674}a{color:#125fb3}details{margin:12px 0}kbd{background:#e1e8f1;padding:2px 6px;border-radius:3px}
+</style>
+<main>
+  <header>
+    <h1>主体掩码逐帧复查</h1>
+    <p>保留罐盖和罐身，擦掉桌面、影子及罐底外的白色区域。暗色区域是背景；绘制不会修改原图。每帧确认后才计入已复查。</p>
+    <div class="tools">
+      <button id="previous">上一帧</button><select id="frames" aria-label="选择视角"></select><button id="next">下一帧</button>
+      <span id="status" role="status"></span>
+    </div>
+  </header>
+  <div class="tools">
+    <label>画笔 <select id="mode"><option value="255">补入主体</option><option value="0">擦掉背景</option></select></label>
+    <label>笔刷大小 <input id="brush" type="range" min="2" max="100" value="20"><span id="brushSize">20</span></label>
+    <label>显示大小 <input id="zoom" type="range" min="50" max="250" value="85"></label>
+    <label><input id="overlay" type="checkbox" checked>显示背景标记</label>
+    <button id="undo">撤销笔画</button><button id="reset">还原本帧原型</button>
+    <button id="confirm" class="primary">确认本帧并下一帧</button>
+  </div>
+  <div id="viewport"><div id="picture"><img id="reference" alt="当前拍摄视角"><canvas id="mask" aria-label="主体掩码画布"></canvas></div></div>
+  <p id="message" role="status"></p>
+  <div class="tools">
+    <button id="download" class="primary">保存复查文件</button>
+    <label>继续上次复查 <input id="resume" type="file" accept="application/json,.json"></label>
+  </div>
+  <details><summary>保存与训练说明</summary><p>复查文件只包含掩码、原图摘要和逐帧确认状态。可以随时保存进度；只有全部视角确认并通过导入校验后才能训练。此页面不上传数据、不启动训练。</p></details>
+</main>
+<script>
+// 原型和原图嵌入本地文件，页面可离线打开，无需额外服务或外部资源。
+const bundle = __MASK_REVIEW_BUNDLE__;
+const names = Object.keys(bundle.frames);
+const states = Object.fromEntries(names.map(name => [name,{png:bundle.frames[name].png,reviewed:false}]));
+const $ = id => document.getElementById(id);
+const canvas = $('mask'), context = canvas.getContext('2d',{willReadFrequently:true});
+let selected = 0, loading = false, drawing = false, lastPoint = null, history = [];
+function notify(text){$('message').textContent=text;}
+function refresh(){
+  const count = names.filter(name=>states[name].reviewed).length;
+  $('status').textContent=`${selected+1}/${names.length} · 已确认 ${count}/${names.length}`;
+  $('previous').disabled=loading||selected===0;$('next').disabled=loading||selected===names.length-1;
+  $('confirm').disabled=loading;$('undo').disabled=loading||!history.length;
+  $('download').disabled=loading;
+  [...$('frames').options].forEach((option,i)=>option.textContent=`${states[names[i]].reviewed?'✓ ':''}${names[i]}`);
+}
+function imageFrom(source){return new Promise((resolve,reject)=>{const image=new Image();image.onload=()=>resolve(image);image.onerror=()=>reject(Error('图像读取失败'));image.src=source;});}
+function persist(){
+  // 画笔圆角会产生灰阶边缘，导出前统一转为明确的 0/255 二值掩码。
+  const pixels=context.getImageData(0,0,canvas.width,canvas.height);
+  for(let i=0;i<pixels.data.length;i+=4){const v=pixels.data[i]>=128?255:0;pixels.data[i]=pixels.data[i+1]=pixels.data[i+2]=v;pixels.data[i+3]=255;}
+  context.putImageData(pixels,0,0);states[names[selected]].png=canvas.toDataURL('image/png').split(',')[1];
+}
+async function show(index,save=true){
+  if(loading||index<0||index>=names.length)return;
+  if(save)persist();loading=true;refresh();
+  try{
+    const name=names[index], item=bundle.frames[name];
+    const [reference,mask]=await Promise.all([imageFrom(item.image),imageFrom('data:image/png;base64,'+states[name].png)]);
+    selected=index;canvas.width=item.width;canvas.height=item.height;
+    $('reference').src=reference.src;context.drawImage(mask,0,0);history=[];
+    $('zoom').oninput();$('viewport').scrollTop=0;
+    $('frames').value=name;notify(states[name].reviewed?'本帧已确认，继续编辑会取消确认。':'请检查罐盖边缘和罐底桌面，必要时补画或擦除。');
+  }catch(error){notify(error.message);}finally{loading=false;refresh();}
+}
+for(const name of names){const option=document.createElement('option');option.value=name;option.textContent=name;$('frames').append(option);}
+$('frames').onchange=()=>show(names.indexOf($('frames').value));
+$('previous').onclick=()=>show(selected-1);$('next').onclick=()=>show(selected+1);
+$('zoom').oninput=()=>{
+  const frame=bundle.frames[names[selected]], fittedHeight=Math.max(240,window.innerHeight-390);
+  $('picture').style.width=`${fittedHeight*frame.width/frame.height*Number($('zoom').value)/85}px`;
+};$('zoom').oninput();
+$('brush').oninput=()=>{$('brushSize').textContent=$('brush').value;};
+$('overlay').onchange=()=>{canvas.style.opacity=$('overlay').checked?'.72':'0';};
+function point(event){const rect=canvas.getBoundingClientRect();return {x:(event.clientX-rect.left)*canvas.width/rect.width,y:(event.clientY-rect.top)*canvas.height/rect.height};}
+function paint(from,to){context.strokeStyle=Number($('mode').value)?'white':'black';context.lineWidth=Number($('brush').value);context.lineCap='round';context.beginPath();context.moveTo(from.x,from.y);context.lineTo(to.x+.01,to.y);context.stroke();}
+canvas.onpointerdown=event=>{
+  if(loading||!$('overlay').checked)return;event.preventDefault();
+  history.push(context.getImageData(0,0,canvas.width,canvas.height));if(history.length>3)history.shift();
+  states[names[selected]].reviewed=false;drawing=true;lastPoint=point(event);canvas.setPointerCapture(event.pointerId);paint(lastPoint,lastPoint);refresh();
+};
+canvas.onpointermove=event=>{if(drawing){const next=point(event);paint(lastPoint,next);lastPoint=next;}};
+canvas.onpointerup=canvas.onpointercancel=()=>{drawing=false;lastPoint=null;};
+$('undo').onclick=()=>{if(history.length){context.putImageData(history.pop(),0,0);states[names[selected]].reviewed=false;refresh();}};
+$('reset').onclick=async()=>{if(loading)return;states[names[selected]]={png:bundle.frames[names[selected]].png,reviewed:false};await show(selected,false);};
+$('confirm').onclick=async()=>{persist();states[names[selected]].reviewed=true;refresh();if(selected<names.length-1)await show(selected+1,false);else notify('已到最后一帧，可保存复查文件。');};
+$('download').onclick=()=>{
+  persist();const frames=Object.fromEntries(names.map(name=>[name,{image_sha256:bundle.frames[name].image_sha256,png:states[name].png,reviewed:states[name].reviewed}]));
+  const blob=new Blob([JSON.stringify({schema_version:1,kind:'manual-mask-review',frames})],{type:'application/json'});
+  const url=URL.createObjectURL(blob),anchor=document.createElement('a');anchor.href=url;anchor.download='reviewed_masks.json';anchor.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+  notify('复查文件已保存；未确认的帧会在导入训练前被拒绝。');
+};
+$('resume').onchange=async event=>{
+  try{
+    const data=JSON.parse(await event.target.files[0].text());
+    if(data.schema_version!==1||JSON.stringify(Object.keys(data.frames).sort())!==JSON.stringify([...names].sort()))throw Error('复查文件的视角集合不一致');
+    for(const name of names){if(data.frames[name].image_sha256!==bundle.frames[name].image_sha256)throw Error('参考图已改变：'+name);}
+    for(const name of names)states[name]={png:data.frames[name].png,reviewed:data.frames[name].reviewed===true};
+    await show(selected,false);notify('已恢复复查进度。');
+  }catch(error){notify('无法恢复：'+error.message);}
+};
+show(0,false);
+</script>
+</html>

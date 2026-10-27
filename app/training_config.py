@@ -94,6 +94,8 @@ def generate_training_config(config_dict: Dict, frame_count=None, resolution=Non
             "checkpoint_every": _number(advanced, "checkpointEvery", 0, 0, 30000, True),
             "validation_every": _number(advanced, "validationEvery", 0, 0, 100, True),
             "refine_stop_ratio": _number(advanced, "refineStopRatio", 0.5, 0.1, 0.95),
+            "mask_foreground_weight": _number(advanced, "maskForegroundWeight", 1.5, 0.1, 10),
+            "mask_background_weight": _number(advanced, "maskBackgroundWeight", 0.25, 0.01, 10),
         },
         "depth": {"enable": depth_enabled,
                   "weight": _number(advanced, "depthWeight", 0.1, 0, 1)},

@@ -17,6 +17,8 @@ def main():
     parser.add_argument("output_dir")
     parser.add_argument("--factor", type=int, default=1)
     parser.add_argument("--split", default="heldout_rgb_supervision")
+    parser.add_argument("--include-background", action="store_true",
+                        help="同一次渲染输出全图、冻结主体矩形及矩形外背景误差")
     args = parser.parse_args()
     from app.dataset import ColmapScene, ColmapDataset
     from app.evaluation import load_ply_params, evaluate_views
@@ -36,12 +38,15 @@ def main():
     indices = [by_name[name] for name in annotations["frames"]]
     # 输出新目录，避免把不同模型的图和指标混在一起。
     Path(args.output_dir).mkdir(parents=True, exist_ok=False)
+    regions = {"additional_roi": annotations["frames"]} if args.include_background else {"roi": annotations["frames"]}
     result = evaluate_views(load_ply_params(args.ply_path), dataset, args.output_dir,
-                            indices=indices, roi=annotations["frames"], split=args.split)
+                            indices=indices, split=args.split, **regions)
     result["annotation_sha256"] = hashlib.sha256(Path(args.annotations).read_bytes()).hexdigest()
     result["annotation_kind"] = annotations.get("annotation_kind", "reference_rectangle")
     (Path(args.output_dir) / "metrics.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(result["averages"], ensure_ascii=False))
+    reported = {"full_frame": result["averages"], "subject": result["subject_averages"],
+                "background": result["background_averages"]} if args.include_background else result["averages"]
+    print(json.dumps(reported, ensure_ascii=False))
 
 
 if __name__ == "__main__":

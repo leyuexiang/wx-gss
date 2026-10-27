@@ -112,6 +112,8 @@ class StageMonitor:
         if self.regions is not None:
             subject = metrics["subject_averages"][str(self.degree)]
             record.update(subject_psnr=subject["psnr"], subject_ssim=subject["ssim"])
+            if str(self.degree) in metrics.get("background_averages", {}):
+                record["background_psnr"] = metrics["background_averages"][str(self.degree)]["psnr"]
         record["monitor_seconds"] = round(time.perf_counter() - started, 4)
         self.seconds += record["monitor_seconds"]
         self.records.append(record)
