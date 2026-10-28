@@ -14,6 +14,7 @@ def main():
     parser.add_argument("output_dir")
     parser.add_argument("--strategy", choices=("default", "mcmc"), default="default")
     parser.add_argument("--iterations", type=int)
+    parser.add_argument("--audit-trace", action="store_true", help="额外保存真实初始化和抽样序列，用于隔离复现诊断")
     parser.add_argument("--refine-stop", type=int, help="固定增密停止步号，其余训练时程保持原样")
     parser.add_argument("--checkpoint-every", type=int, default=0)
     parser.add_argument("--subject-roi", help="冻结的参考图矩形及摘要文件")
@@ -31,6 +32,8 @@ def main():
     config = json.loads((root / "training_config.json").read_text(encoding="utf-8"))
     runtime = json.loads((root / "effective_config.json").read_text(encoding="utf-8"))
     options = dict(config["training"], strategy=args.strategy)
+    if args.audit_trace:
+        options["audit_trace"] = True
     iterations = args.iterations or runtime["iterations"]
     if args.refine_stop is not None:
         if not 500 < args.refine_stop < iterations:

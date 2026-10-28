@@ -230,8 +230,16 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         monitor = StageMonitor(out_dir, dataset, validation_indices, options["checkpoint_every"],
                                sh_degree, enable_antialiasing, options.get("monitor_roi_path"))
 
+    audit = None
+    if options.get("audit_trace", False):
+        from app.training_audit import TrainingAudit
+        audit = TrainingAudit(out_dir, params, scene, iterations)
+
     for step in range(iterations):
-        data = dataset[int(np.random.choice(train_indices))]
+        sampled_index = int(np.random.choice(train_indices))
+        if audit is not None:
+            audit.record(sampled_index)
+        data = dataset[sampled_index]
         # 有界八位缓存减少重复解码，显卡端转浮点避免每一步在 CPU 分配整张浮点图。
         image = data["image"].to(device=device, dtype=torch.float32, non_blocking=True).div_(255.0)
         H, W = image.shape[1], image.shape[2]
@@ -358,6 +366,8 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         # 用已完成步数命名阶段；策略仍使用从零开始的步号，避免增密时程偏移。
         if monitor is not None and monitor.due(step + 1, iterations):
             stage = monitor.record(params, step + 1, scheduler.get_last_lr()[0], sh_degree_now)
+            if audit is not None:
+                audit.save()
             progress_cb(step + 1, iterations,
                         f"阶段 {step + 1} 验证全图PSNR={stage['full_psnr']:.4f} "
                         f"主体PSNR={stage.get('subject_psnr', float('nan')):.4f}")
@@ -368,6 +378,8 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
                         f"高斯数={params['means'].shape[0]} "
                         f"显存={torch.cuda.max_memory_allocated() / 2**30:.1f}GB")
 
+    if audit is not None:
+        audit.save()
     num_gs = params["means"].shape[0]
     mem_gb = torch.cuda.max_memory_allocated() / 2**30
 
