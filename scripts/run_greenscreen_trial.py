@@ -34,6 +34,7 @@ def prepare(source, task, status, reuse_task=None):
     shutil.copytree(source / "images", task / "images")
     shutil.copy2(source / "selection.json", task / "selection.json")
     source_protocol = json.loads((source / "selection.json").read_text(encoding="utf-8"))
+    source_masks = json.loads((source / "feature_masks/mask_manifest.json").read_text(encoding="utf-8"))
     (task / "sfm_masks").mkdir()
     (task / "foreground_original").mkdir()
     for name in names:
@@ -72,7 +73,7 @@ def prepare(source, task, status, reuse_task=None):
               "--input_path", str(task / "colmap/merged_refined"), "--output_path", dense,
               "--output_type", "COLMAP", "--max_image_size", "2000"],
              str(task / "colmap/colmap.log"), "undistort_reused_model")
-    _, registered, ratio = _prepare_dataset(str(task), dense, 1, len(names), status)
+    _, registered, ratio = _prepare_dataset(str(task), dense, 1, len(names), status, quality_gate=True)
     candidates = []
     for path in (task / "colmap/sparse").glob("*"):
         if (path / "images.bin").exists():
@@ -98,7 +99,8 @@ def prepare(source, task, status, reuse_task=None):
             "image_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             "mask_sha256": hashlib.sha256(destination.read_bytes()).hexdigest()}
     (masks / "mask_manifest.json").write_text(json.dumps({"schema_version": 1,
-        "kind": "automatic-white-can-grabcut-with-colmap-undistortion", "frames": entries}, indent=2), encoding="utf-8")
+        "kind": "foreground-with-colmap-undistortion", "provider": source_masks.get("provider", "legacy_unspecified"),
+        "source_kind": source_masks.get("kind", "unspecified"), "frames": entries}, indent=2), encoding="utf-8")
     status("prepared", "prepared", .4, f"独立绿幕实验已准备：{registered}/{len(names)} 张，注册率 {ratio:.1%}")
 
 
@@ -111,12 +113,14 @@ def train_trial(task, iterations, status):
     if report["registration_ratio"] < .9:
         raise ValueError("注册率不足 90%，拒绝把局部分量作为完整绿幕模型训练")
     output = task / "output"
-    output.mkdir(exist_ok=False)
     config = generate_training_config({"qualityMode": "high", "advanced": {
         "validationEvery": 8, "opacityThreshold": .005, "imageCacheMB": 256}}, scene_type="object")
     options = config["training"]
     options.update(rigid_normalization=True, mask_dir=str(task / "subject_masks"),
                    allow_unreviewed_masks=True, foreground_only=True, silhouette_weight=.1)
+    from app.capture.provenance import freeze_training_protocol
+    freeze_training_protocol(task, options, iterations, Path(__file__).resolve().parents[1])
+    output.mkdir(exist_ok=False)
     save_training_config(str(task), config)
     save_training_config(str(task), {"iterations": iterations, "downsample": 1,
         "cap_max": options["cap_max"], "sfm_backend": "colmap", "requested_config": config}, "effective_config.json")

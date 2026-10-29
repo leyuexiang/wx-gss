@@ -190,7 +190,8 @@ def _run_colmap(task_dir: str, n_images: int, status_cb, options=None):
     return dense
 
 
-def _prepare_dataset(task_dir: str, dense_dir: str, downsample: int, n_images: int, status_cb):
+def _prepare_dataset(task_dir: str, dense_dir: str, downsample: int, n_images: int, status_cb,
+                     quality_gate: bool = False):
     """整理成 dataset/{sparse/0, images_{factor}} 布局并校验注册率。"""
     import pycolmap
     from PIL import Image
@@ -206,11 +207,18 @@ def _prepare_dataset(task_dir: str, dense_dir: str, downsample: int, n_images: i
     ratio = n_registered / n_images
     # 记录重建诊断，成功注册不等于几何精度可靠。
     errors = [point.error for point in rec.points3D.values() if np.isfinite(point.error)]
-    with open(os.path.join(task_dir, "reconstruction_report.json"), "w", encoding="utf-8") as output:
-        json.dump({"backend": "colmap", "input_images": n_images, "registered_images": n_registered,
+    reconstruction_report = {"backend": "colmap", "input_images": n_images, "registered_images": n_registered,
                    "registration_ratio": ratio, "mean_reprojection_error": float(np.mean(errors)) if errors else None,
-                   "warning": "注册率低于 90%，需要检查缺失视角" if ratio < 0.9 else None},
-                  output, ensure_ascii=False, indent=2)
+                   "warning": "注册率低于 90%，需要检查缺失视角" if ratio < 0.9 else None}
+    if quality_gate:
+        from app.capture import evaluate_reconstruction
+        gate = evaluate_reconstruction(reconstruction_report, max_angular_gap_degrees=None)
+        reconstruction_report["quality_gate"] = gate
+    with open(os.path.join(task_dir, "reconstruction_report.json"), "w", encoding="utf-8") as output:
+        json.dump(reconstruction_report, output, ensure_ascii=False, indent=2)
+    # 拒绝也必须留存诊断，避免失败后丢失质量门禁的具体原因。
+    if quality_gate and not gate["passed"]:
+        raise RuntimeError(f"重建质量门禁未通过：{gate['checks']}")
     if n_registered < MIN_IMAGES or ratio < 0.5:
         raise RuntimeError(
             f"COLMAP 注册图片不足：{n_registered}/{n_images}（{ratio:.0%}）。"
