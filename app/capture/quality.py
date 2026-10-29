@@ -11,6 +11,24 @@ def _finite(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
+def evaluate_foreground_support(mask, support, min_coverage=.95):
+    """检查掩码是否删掉外部前景证据；证据可来自人工或先验，不等同于真值。"""
+    import numpy as np
+    if (mask.shape != support.shape or mask.ndim != 2
+            or not np.all((mask == 0) | (mask == 255))
+            or not np.all((support == 0) | (support == 255))):
+        raise ValueError("前景证据与掩码必须是同尺寸二值图")
+    if not _finite(min_coverage) or not 0 < min_coverage <= 1:
+        raise ValueError("前景覆盖门槛无效")
+    reference = support > 0
+    pixels = int(reference.sum())
+    if pixels == 0:
+        raise ValueError("没有可用的前景证据")
+    coverage = int(((mask > 0) & reference).sum()) / pixels
+    return {"passed": coverage >= min_coverage, "support_pixels": pixels,
+            "coverage": coverage, "min_coverage": min_coverage}
+
+
 def evaluate_mask_ratios(ratios: Iterable[float], min_ratio: float = .01,
                          max_ratio: float = .95, max_jump: float = .20) -> Dict[str, Any]:
     """检查前景面积范围和相邻帧跳变，返回报告而不是静默放行。"""

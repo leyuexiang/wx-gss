@@ -35,6 +35,7 @@ def freeze_training_protocol(task, options, iterations, source_root):
     sources = ["app/trainer.py", "app/dataset.py", "app/pipeline.py", "app/subject_masks.py",
                "app/evaluation.py", "app/foreground/__init__.py", "app/capture/provenance.py",
                "app/capture/camera_groups.py",
+               "app/capture/splits.py",
                "scripts/run_greenscreen_trial.py"]
     sources += [str(path.relative_to(root)).replace("\\", "/")
                 for path in sorted((root / "app/foreground/priors").glob("*.py"))]

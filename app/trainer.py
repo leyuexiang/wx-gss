@@ -200,7 +200,8 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
             raise ValueError(f"验证视角未成功定位：{sorted(unknown)}")
         validation_indices = [index for index, name in enumerate(scene.names) if name in requested_names]
     validation_set = set(validation_indices)
-    train_indices = [index for index in range(n_images) if index not in validation_set]
+    from app.capture.splits import training_indices
+    train_indices = training_indices(scene.names, validation_indices, options.get("training_names"))
     if len(train_indices) < 2:
         raise ValueError("留出验证视角后至少需要两张训练图像")
     bilateral = None

@@ -21,6 +21,7 @@ class PriorProvider:
     name: str
     scope: str
     coarse_algorithm: Callable
+    version: int = 1
 
     def coarse(self, rgb):
         """在算法运行前拒绝通道、位深和空图错误。"""
@@ -42,7 +43,7 @@ class PriorProvider:
 
     def describe(self):
         """未人工复查的算法输出不能伪装成已确认的标注。"""
-        return {"name": self.name, "version": 1, "kind": "color_shape_prior",
+        return {"name": self.name, "version": self.version, "kind": "color_shape_prior",
                 "scope": self.scope, "reviewed": False}
 
 
@@ -55,4 +56,7 @@ def get_provider(name) -> ForegroundProvider:
         from .priors.red_can import red_can_mask, gold_cap_mask
         return PriorProvider(name, "红色罐身与金盖" if name == "red_can" else "灰色桌面上的金属圆面",
                              red_can_mask if name == "red_can" else gold_cap_mask)
+    if name == "red_can_v2":
+        from .priors.red_can import red_can_mask_v2
+        return PriorProvider(name, "红色圆罐，合并竖向条纹两侧的主体红色块", red_can_mask_v2, version=2)
     raise ValueError(f"不支持的前景适配器：{name}；通用分割尚未接入")

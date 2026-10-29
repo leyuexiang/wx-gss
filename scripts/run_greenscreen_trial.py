@@ -35,6 +35,9 @@ def prepare(source, task, status, reuse_task=None):
     shutil.copy2(source / "selection.json", task / "selection.json")
     source_protocol = json.loads((source / "selection.json").read_text(encoding="utf-8"))
     source_masks = json.loads((source / "feature_masks/mask_manifest.json").read_text(encoding="utf-8"))
+    # 新准备器若提供明确失败的质量检查，不能继续执行昂贵的几何和训练。
+    if source_masks.get("quality", {}).get("passed") is False:
+        raise ValueError("前景质量检查未通过，拒绝继续重建")
     (task / "sfm_masks").mkdir()
     (task / "foreground_original").mkdir()
     for name in names:

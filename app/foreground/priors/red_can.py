@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 
 
-def red_can_mask(rgb):
+def red_can_mask(rgb, bridge_fragments=False):
     """以红色罐身定位金盖区域，排除绿色背景和底部转台反射。"""
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     red = (((hsv[:, :, 0] < 16) | (hsv[:, :, 0] > 165))
@@ -14,6 +14,19 @@ def red_can_mask(rgb):
     if not contours:
         raise ValueError("没有找到红色罐身")
     body = max(contours, key=cv2.contourArea)
+    if bridge_fragments:
+        # 竖向白色条码/高光会把同一罐身分成多个红色连通块，不能只保留最大块。
+        bx, by, bw, bh = cv2.boundingRect(body)
+        area = cv2.contourArea(body)
+        aligned = []
+        for contour in contours:
+            cx, cy, cw, ch = cv2.boundingRect(contour)
+            overlap = max(0, min(by + bh, cy + ch) - max(by, cy))
+            gap = max(0, max(bx, cx) - min(bx + bw, cx + cw))
+            if (cv2.contourArea(contour) >= .1 * area and overlap >= .7 * min(bh, ch)
+                    and gap < .15 * rgb.shape[1]):
+                aligned.append(contour)
+        body = cv2.convexHull(np.concatenate(aligned))
     x, y, width, height = cv2.boundingRect(body)
     if width * height < rgb.shape[0] * rgb.shape[1] * .02:
         raise ValueError("红色主体过小，拒绝生成掩码")
@@ -31,6 +44,11 @@ def red_can_mask(rgb):
     mask = np.zeros_like(red)
     cv2.drawContours(mask, [hull], -1, 255, cv2.FILLED)
     return mask
+
+
+def red_can_mask_v2(rgb):
+    """显式第二版红罐插件，修正竖向条纹断开；不改变历史第一版结果。"""
+    return red_can_mask(rgb, bridge_fragments=True)
 
 
 def gold_cap_mask(rgb):
