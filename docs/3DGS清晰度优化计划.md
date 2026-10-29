@@ -297,3 +297,5 @@ P0 完成后再决定 P1 中最有收益的项目。若同相机的训练渲染�
 - [gsplat 增密策略说明](https://docs.gsplat.studio/main/apis/strategy.html)。
 - [当前查看器说明](../frontend/node_modules/@mkkellogg/gaussian-splats-3d/README.md)：需要先安装前端依赖才能读取本地文件。
 - 历史文档：[质量优化方案](质量优化方案.md)、[质量优化立即实施方案](质量优化立即实施方案.md)。历史建议与当前代码不一致时，以源码核对及本计划的对照结果为准。
+
+- [x] 通用训练框架实施计划与里程碑，见 [3DGS通用训练框架实施计划与里程碑](3DGS通用训练框架实施计划与里程碑.md)。
