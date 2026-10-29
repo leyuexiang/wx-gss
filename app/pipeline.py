@@ -79,13 +79,20 @@ def _run_colmap(task_dir: str, n_images: int, status_cb, options=None):
 
     options = options or {}
     use_gpu = "1" if options.get("use_gpu", COLMAP_USE_GPU) else "0"
+    groups = options.get("feature_groups")
+    if groups:
+        from app.capture.camera_groups import validate_feature_groups, audit_feature_groups
+        checked_groups = validate_feature_groups(groups, images_dir, options.get("camera_model", "OPENCV"))
+        # 重用旧数据库可能沿用错误的逐帧内参；要求显式新任务而不是悄悄覆盖历史结果。
+        if os.path.exists(db):
+            raise ValueError("相机分组修正必须使用新的重建数据库")
 
     status_cb("colmap", "feature_extractor", 0.05, "COLMAP 特征提取中")
     feature_command = [
         "colmap", "feature_extractor",
         "--database_path", db,
         "--image_path", images_dir,
-        "--ImageReader.single_camera", "0" if options.get("feature_groups") else "1",
+        "--ImageReader.single_camera", "1",
         "--ImageReader.camera_model", options.get("camera_model", "OPENCV"),
         "--SiftExtraction.use_gpu", use_gpu,
     ]
@@ -95,13 +102,15 @@ def _run_colmap(task_dir: str, n_images: int, status_cb, options=None):
         if not os.path.isdir(mask_path):
             raise ValueError("COLMAP 特征掩码目录不存在")
         feature_command.extend(["--ImageReader.mask_path", mask_path])
-    groups = options.get("feature_groups")
     if groups:
-        # 视频共用一组内参，补拍照片各自独立；裁切后主点随像素偏移同步平移。
+        # 每组单独启动一次工具并启用共享相机；否则同一视频也会产生逐帧内参。
         for index, group in enumerate(groups):
             command = feature_command + ["--image_list_path", group["image_list"],
                 "--ImageReader.camera_params", ",".join(str(value) for value in group["camera_params"])]
             _run(command, log_path, f"feature_extractor_group_{index}")
+        group_audit = audit_feature_groups(db, checked_groups)
+        from app.capture.quality import write_protocol
+        write_protocol(os.path.join(colmap_dir, "camera_groups.json"), group_audit)
     else:
         _run(feature_command, log_path, "feature_extractor")
 

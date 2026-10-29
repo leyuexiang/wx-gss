@@ -38,6 +38,8 @@ class ForegroundProviderTests(unittest.TestCase):
             masks = task / "masks"
             masks.mkdir()
             (masks / "mask_manifest.json").write_text(json.dumps({"provider": {"name": "red_can"}}), encoding="utf-8")
+            (task / "colmap").mkdir()
+            (task / "colmap/camera_groups.json").write_text(json.dumps({"passed": True, "group_count": 3}), encoding="utf-8")
             scene = SimpleNamespace(names=["one.png"], dimensions=[{"width": 123, "height": 234}])
             report = {"frames": [{"name": "one.png", "reviewed": False}], "manifest_sha256": "mask"}
             options = {"mask_dir": str(masks), "allow_unreviewed_masks": True, "foreground_only": True}
@@ -48,6 +50,7 @@ class ForegroundProviderTests(unittest.TestCase):
                 self.assertEqual(payload["actual_image_dimensions"], scene.dimensions)
                 self.assertEqual(payload["foreground_provider"]["name"], "red_can")
                 self.assertIn("app/trainer.py", payload["sources"])
+                self.assertEqual(payload["camera_groups"]["report"]["group_count"], 3)
                 with self.assertRaisesRegex(ValueError, "协议已存在"):
                     freeze_training_protocol(task, options, 7000, Path(__file__).resolve().parents[1])
 

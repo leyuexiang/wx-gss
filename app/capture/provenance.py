@@ -34,6 +34,7 @@ def freeze_training_protocol(task, options, iterations, source_root):
     # 只审计本链路直接使用的训练、几何和适配器源码，不扫描数据或个人文件。
     sources = ["app/trainer.py", "app/dataset.py", "app/pipeline.py", "app/subject_masks.py",
                "app/evaluation.py", "app/foreground/__init__.py", "app/capture/provenance.py",
+               "app/capture/camera_groups.py",
                "scripts/run_greenscreen_trial.py"]
     sources += [str(path.relative_to(root)).replace("\\", "/")
                 for path in sorted((root / "app/foreground/priors").glob("*.py"))]
@@ -50,5 +51,9 @@ def freeze_training_protocol(task, options, iterations, source_root):
         "mask_manifest_sha256": report["manifest_sha256"],
         "sources": {name: file_digest(root / name) for name in sources},
         "validation_scope": "仅留出颜色监督；几何可能使用全部注册图，不是独立几何测试"}
+    camera_audit = task / "colmap/camera_groups.json"
+    if camera_audit.exists():
+        payload["camera_groups"] = {"sha256": file_digest(camera_audit),
+                                    "report": json.loads(camera_audit.read_text(encoding="utf-8"))}
     write_protocol(str(destination), payload)
     return payload
