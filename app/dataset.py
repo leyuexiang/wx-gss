@@ -138,10 +138,13 @@ class ColmapScene:
 
 class ColmapDataset(Dataset):
     def __init__(self, scene: ColmapScene, cache_bytes: int = 64 * 1024**2,
-                 uint8_images=False, mask_dir=None, allow_unreviewed_masks=False):
+                 uint8_images=False, mask_dir=None, allow_unreviewed_masks=False, foreground_only=False):
         self.scene = scene
         self.uint8_images = uint8_images
         self.mask_dir = os.path.abspath(mask_dir) if mask_dir else None
+        self.foreground_only = foreground_only
+        if foreground_only and not self.mask_dir:
+            raise ValueError("前景独立训练必须提供完整主体掩码")
         if self.mask_dir and not os.path.isdir(self.mask_dir):
             raise ValueError(f"主体掩码目录不存在：{self.mask_dir}")
         self.mask_paths, self.mask_report = {}, None
@@ -193,6 +196,9 @@ class ColmapDataset(Dataset):
             if mask.shape != (self.scene.dimensions[idx]["height"], self.scene.dimensions[idx]["width"]):
                 raise ValueError(f"主体掩码尺寸不匹配：{self.scene.names[idx]}")
             data["mask"] = torch.from_numpy(mask).contiguous()
+            if self.foreground_only:
+                # 仅修改内存中的训练参考，保留原始文件与摘要；阶段监控也使用同一参考约定。
+                data["image"].masked_fill_(data["mask"][None] == 0, 0)
 
         # 加载深度图（如果存在）
         if self.scene.has_depth:

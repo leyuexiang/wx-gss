@@ -14,12 +14,41 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from app.subject_masks import validate_mask_set, validate_mask_weights, weighted_l1
+from app.subject_masks import validate_mask_set, validate_mask_weights, weighted_l1, silhouette_loss
+from app.dataset import ColmapDataset
 from scripts.import_reviewed_masks import import_masks
 from scripts.prepare_interpolated_masks import interpolate_boxes
 
 
 class SubjectMaskTests(unittest.TestCase):
+    def test_silhouette_gradients_remove_outside_opacity_and_restore_inside(self):
+        alpha = torch.full((2, 4), .5, requires_grad=True)
+        mask = torch.zeros_like(alpha)
+        mask[0, 0] = 1
+        loss = silhouette_loss(alpha, mask)
+        gradient, = torch.autograd.grad(loss, alpha)
+        self.assertAlmostEqual(loss.item(), .5)
+        self.assertLess(gradient[0, 0], 0)
+        self.assertTrue(torch.all(gradient[mask == 0] > 0))
+        self.assertAlmostEqual(float(-gradient[0, 0]), float(gradient[mask == 0].sum()))
+
+    def test_foreground_reference_does_not_modify_original_or_mask(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            scene, masks, _ = self.fixture(temporary)
+            scene.n_images = 1
+            scene.has_depth = False
+            scene.camtoworlds = np.eye(4)[None]
+            scene.Ks = np.eye(3)[None]
+            original = (Path(scene.image_dir) / "view.jpg").read_bytes()
+            dataset = ColmapDataset(scene, mask_dir=masks, uint8_images=True, foreground_only=True)
+            sample = dataset[0]
+            self.assertEqual(sample["image"][:, :, 4:].count_nonzero(), 0)
+            self.assertGreater(sample["image"][:, :, :4].sum(), 0)
+            self.assertTrue(torch.all(sample["mask"][:, :4] == 255))
+            self.assertEqual((Path(scene.image_dir) / "view.jpg").read_bytes(), original)
+            with self.assertRaisesRegex(ValueError, "必须提供"):
+                ColmapDataset(scene, foreground_only=True)
+
     def test_equal_weight_preserves_loss_and_gradients_for_all_channels(self):
         prediction = torch.arange(36, dtype=torch.float32).reshape(3, 3, 4).div(36).requires_grad_()
         target = torch.full_like(prediction, .4)

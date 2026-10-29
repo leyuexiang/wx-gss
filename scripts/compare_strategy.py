@@ -23,6 +23,8 @@ def main():
     parser.add_argument("--checkpoint-every", type=int, default=0)
     parser.add_argument("--subject-roi", help="冻结的参考图矩形及摘要文件")
     parser.add_argument("--mask-dir", help="可选主体掩码目录；仅用于隔离实验")
+    parser.add_argument("--foreground-only", action="store_true", help="使用前景黑底参考和轮廓透明度约束")
+    parser.add_argument("--silhouette-weight", type=float, default=.1)
     parser.add_argument("--allow-unreviewed-masks", action="store_true", help="允许自动原型探索或合成流程检查，不代表掩码已复查")
     parser.add_argument("--mask-foreground-weight", type=float, default=1.5)
     parser.add_argument("--mask-background-weight", type=float, default=0.25)
@@ -37,7 +39,8 @@ def main():
     runtime = json.loads((root / "effective_config.json").read_text(encoding="utf-8"))
     options = dict(config["training"], strategy=args.strategy)
     options.update(sparse_depth=args.sparse_depth, sparse_depth_weight=args.sparse_depth_weight,
-                   bilateral_grid=args.bilateral_grid, rigid_normalization=args.rigid_normalization)
+                   bilateral_grid=args.bilateral_grid, rigid_normalization=args.rigid_normalization,
+                   foreground_only=args.foreground_only, silhouette_weight=args.silhouette_weight)
     if args.audit_trace:
         options["audit_trace"] = True
     iterations = args.iterations or runtime["iterations"]

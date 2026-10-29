@@ -103,7 +103,7 @@ def evaluate_views(params: dict, dataset, output_dir: str, indices=None,
         tiles = [Image.fromarray((target.permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype("uint8"))] if save_images else []
         panels = ["reference"]
         for degree in degrees:
-            rendered, _, _ = rasterization(
+            rendered, alphas, _ = rasterization(
                 means=params["means"], scales=scales, quats=rotations,
                 opacities=opacities, colors=features,
                 viewmats=torch.linalg.inv(data["camtoworld"].to(device))[None],
@@ -123,6 +123,18 @@ def evaluate_views(params: dict, dataset, output_dir: str, indices=None,
                 "roi": box,
                 **_image_metrics(measured_prediction, measured_target),
             }
+            if getattr(dataset, "foreground_only", False):
+                # 黑色背景占比较大会抬高全图分数，必须额外报告真正前景及轮廓质量。
+                foreground = data["mask"].to(device) > 0
+                alpha = alphas[0, :, :, 0]
+                mse = (prediction - target).square().mean(dim=0)[foreground].mean().item()
+                union = ((alpha >= .5) | foreground).sum().clamp_min(1)
+                record["foreground"] = {
+                    "psnr": float(-10 * math.log10(max(mse, 1e-12))),
+                    "outside_alpha_mean": float(alpha[~foreground].mean()),
+                    "inside_alpha_mae": float((1 - alpha[foreground]).abs().mean()),
+                    "silhouette_iou": float(((alpha >= .5) & foreground).sum() / union),
+                }
             if subject_box is not None:
                 x, y, crop_width, crop_height = subject_box
                 record["subject"] = {"roi": subject_box, **_image_metrics(
@@ -159,11 +171,19 @@ def evaluate_views(params: dict, dataset, output_dir: str, indices=None,
         "split": split, "roi": roi, "antialiased": antialiased,
         "region_kind": "fixed_reference_rectangle" if roi is not None else "full_frame",
         "indices": indices, "records": records,
+        "reference_kind": ("foreground_black_background" if getattr(dataset, "foreground_only", False)
+                           else "original_full_frame"),
         "averages": {str(degree): {
             metric: float(np.mean([record[metric] for record in records if record["sh_degree"] == degree]))
             for metric in ("psnr", "ssim")
         } for degree in degrees},
     }
+    if getattr(dataset, "foreground_only", False):
+        result["foreground_averages"] = {str(degree): {
+            metric: float(np.mean([record["foreground"][metric] for record in records
+                                   if record["sh_degree"] == degree]))
+            for metric in ("psnr", "outside_alpha_mean", "inside_alpha_mae", "silhouette_iou")
+        } for degree in degrees}
     if additional_roi is not None:
         result["subject_roi"] = additional_roi
         result["subject_averages"] = {str(degree): {

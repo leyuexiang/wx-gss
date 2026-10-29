@@ -245,10 +245,43 @@ class QualityPipelineTests(unittest.TestCase):
                 return SimpleNamespace(images=list(range(count)), points3D=list(range(count * 10)))
 
             with patch("app.pipeline._run") as commands, patch("pycolmap.Reconstruction", side_effect=reconstruction):
-                _run_colmap(temporary, 60, lambda *args: None, {"camera_model": "SIMPLE_RADIAL"})
+                masks = Path(temporary) / "masks"
+                masks.mkdir()
+                _run_colmap(temporary, 60, lambda *args: None,
+                            {"camera_model": "SIMPLE_RADIAL", "mask_path": str(masks)})
+            feature_command = commands.call_args_list[0].args[0]
+            self.assertEqual(feature_command[feature_command.index("--ImageReader.mask_path") + 1], str(masks))
             undistort_command = commands.call_args.args[0]
             position = undistort_command.index("--input_path")
             self.assertEqual(Path(undistort_command[position + 1]).name, "1")
+
+    def test_optional_component_merge_requires_shared_views_and_refines_before_undistort(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            for name in ("0", "1", "2"):
+                path = Path(temporary) / "colmap/sparse" / name
+                path.mkdir(parents=True)
+                (path / "images.bin").touch()
+
+            def reconstruction(path):
+                path = Path(path)
+                if "component_merges" in path.parts or path.name == "merged_refined":
+                    names, points = "abcde", 55
+                elif path.name == "0":
+                    names, points = "abcd", 40
+                elif path.name == "1":
+                    names, points = "bcde", 30
+                else:
+                    names, points = "xy", 20
+                return SimpleNamespace(images={i: SimpleNamespace(name=name) for i, name in enumerate(names)},
+                                       points3D=list(range(points)))
+
+            with patch("app.pipeline._run") as commands, patch("pycolmap.Reconstruction", side_effect=reconstruction):
+                _run_colmap(temporary, 7, lambda *args: None, {"merge_components": True})
+            calls = [call.args[0] for call in commands.call_args_list]
+            self.assertEqual(sum(command[1] == "model_merger" for command in calls), 1)
+            self.assertEqual(calls[-2][1], "bundle_adjuster")
+            command = calls[-1]
+            self.assertEqual(Path(command[command.index("--input_path") + 1]).name, "merged_refined")
 
     def test_high_quality_views_keep_temporal_coverage(self):
         with tempfile.TemporaryDirectory() as temporary:

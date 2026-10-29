@@ -135,13 +135,20 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
                         rigid_normalization=rigid_normalization)
     cache_bytes = options.get("image_cache_mb", 256) * 1024**2
     mask_dir = options.get("mask_dir")
+    foreground_only = options.get("foreground_only", False)
+    silhouette_weight = options.get("silhouette_weight", .1)
+    if foreground_only and (not mask_dir or bilateral_enabled):
+        raise ValueError("前景独立训练需要掩码，暂不与双边网格混用")
+    if foreground_only and (isinstance(silhouette_weight, bool) or not isinstance(silhouette_weight, (int, float))
+                            or not math.isfinite(silhouette_weight) or not 0 < silhouette_weight <= 1):
+        raise ValueError("轮廓监督权重必须在 (0, 1] 内")
     allow_unreviewed_masks = options.get("allow_unreviewed_masks", False)
     dataset = ColmapDataset(scene, cache_bytes=cache_bytes, uint8_images=True, mask_dir=mask_dir,
-                            allow_unreviewed_masks=allow_unreviewed_masks)
+                            allow_unreviewed_masks=allow_unreviewed_masks, foreground_only=foreground_only)
     mask_foreground_weight = options.get("mask_foreground_weight", 1.5)
     mask_background_weight = options.get("mask_background_weight", 0.25)
     if mask_dir:
-        from app.subject_masks import validate_mask_weights, weighted_l1
+        from app.subject_masks import validate_mask_weights, weighted_l1, silhouette_loss
         validate_mask_weights(mask_foreground_weight, mask_background_weight)
         from app.training_monitor import write_json_atomic
         write_json_atomic(os.path.join(out_dir, "mask_validation.json"), dataset.mask_report)
@@ -218,10 +225,12 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         "antialiased": enable_antialiasing, "image_dimensions": scene.dimensions,
         "image_cache_mb": cache_bytes // 1024**2, "cached_image_dtype": "uint8",
         "mask_dir": mask_dir, "mask_loss": {
-            "scope": "仅对 L1 像素误差加权，SSIM 保持全图；不是背景分割导出",
+            "scope": ("前景黑底参考、全图颜色与结构损失及轮廓透明度监督" if foreground_only
+                      else "仅对 L1 像素误差加权，SSIM 保持全图；不是背景分割导出"),
             "manifest_sha256": dataset.mask_report["manifest_sha256"],
             "foreground_weight": mask_foreground_weight,
             "background_weight": mask_background_weight,
+            "foreground_only": foreground_only, "silhouette_weight": silhouette_weight if foreground_only else 0,
         } if mask_dir else None,
         "train_indices": train_indices, "validation_indices": validation_indices,
         "validation_scope": options.get("validation_scope", "仅留出颜色监督；相机重建和初始点云可能使用全部输入，不能称为完全未见视角"),
@@ -286,7 +295,7 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         # 启用深度渲染（如果需要深度正则化）
         render_mode = "RGB+ED" if sparse_enabled or (has_depth and "depth" in data) else "RGB"
 
-        renders, _, info = rasterization(
+        renders, alphas, info = rasterization(
             means=params["means"],
             quats=F.normalize(params["quats"], dim=-1),
             # gsplat rasterization 期望激活后的值：scales 线性、opacities (0,1)；
@@ -326,8 +335,9 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
             pred_rgb = bilateral(pred_rgb, data["image_id"])
         if mask_dir:
             mask = data["mask"].to(device=device, dtype=torch.float32).div_(255.0)
-            # 归一化后的权重强调主体，但保持原图作为监督，不把背景涂成黑色。
-            l1 = weighted_l1(pred_rgb, image, mask, mask_foreground_weight, mask_background_weight)
+            # 前景独立模式使用黑底参考，另加透明度约束；普通加权模式保留原图。
+            l1 = (F.l1_loss(pred_rgb, image) if foreground_only else
+                  weighted_l1(pred_rgb, image, mask, mask_foreground_weight, mask_background_weight))
         else:
             l1 = F.l1_loss(pred_rgb, image)
         ssim_val = ssim_fn(pred_rgb[None], image[None])
@@ -358,6 +368,8 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
 
         # 总loss
         loss = photo_loss + depth_weight * depth_loss_val + pose_reg_loss_val + smoothness_loss_val
+        if foreground_only:
+            loss = loss + silhouette_weight * silhouette_loss(alphas[0, :, :, 0], mask)
         if sparse_enabled:
             loss = loss + sparse_weight * inverse_depth_loss(rendered_depth,
                 data["sparse_xy"].to(device), data["sparse_depth"].to(device))
@@ -431,7 +443,7 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         print(f"已保存优化后的位姿: {optimized_poses.shape}")
         scene.camtoworlds = optimized_poses
         dataset = ColmapDataset(scene, cache_bytes=cache_bytes, uint8_images=True, mask_dir=mask_dir,
-                                allow_unreviewed_masks=allow_unreviewed_masks)
+                                allow_unreviewed_masks=allow_unreviewed_masks, foreground_only=foreground_only)
 
     from app.export import export_gaussians
     # 统计交付模型实际包含的点数，避免清理前的数量误导质量判断。
@@ -470,6 +482,8 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         "n_validation_images": len(validation_indices), "antialiased": enable_antialiasing,
         "evaluation": evaluation["averages"],
         "validation": validation["averages"] if validation else None,
+        "reference_kind": "foreground_black_background" if foreground_only else "original_full_frame",
+        "foreground_validation": validation.get("foreground_averages") if validation else None,
     }
     if monitor is not None:
         if validation is not None:

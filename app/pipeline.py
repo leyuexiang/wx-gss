@@ -81,14 +81,21 @@ def _run_colmap(task_dir: str, n_images: int, status_cb, options=None):
     use_gpu = "1" if options.get("use_gpu", COLMAP_USE_GPU) else "0"
 
     status_cb("colmap", "feature_extractor", 0.05, "COLMAP 特征提取中")
-    _run([
+    feature_command = [
         "colmap", "feature_extractor",
         "--database_path", db,
         "--image_path", images_dir,
         "--ImageReader.single_camera", "1",
         "--ImageReader.camera_model", options.get("camera_model", "OPENCV"),
         "--SiftExtraction.use_gpu", use_gpu,
-    ], log_path, "feature_extractor")
+    ]
+    # 转台实验必须屏蔽静止背景特征；仅内部选项启用，保留普通任务原有行为。
+    if options.get("mask_path"):
+        mask_path = os.path.abspath(options["mask_path"])
+        if not os.path.isdir(mask_path):
+            raise ValueError("COLMAP 特征掩码目录不存在")
+        feature_command.extend(["--ImageReader.mask_path", mask_path])
+    _run(feature_command, log_path, "feature_extractor")
 
     status_cb("colmap", "matcher", 0.15, "COLMAP 特征匹配中")
     matcher = options.get("matcher", "auto")
@@ -131,6 +138,35 @@ def _run_colmap(task_dir: str, n_images: int, status_cb, options=None):
     if not candidates:
         raise RuntimeError("COLMAP 重建失败：图片之间重叠度不足或纹理太少，请重新拍摄")
     registered, _, model_dir = max(candidates)
+    if options.get("merge_components", False):
+        # 转台可能将同一物体的两侧分开初始化，只合并有共同已注册视角的分量。
+        # 不按人为旋转角拼接，不改变普通重建任务默认选择最大分量的行为。
+        current = pycolmap.Reconstruction(model_dir)
+        for index, (_, _, candidate_dir) in enumerate(sorted(candidates, reverse=True)):
+            other = pycolmap.Reconstruction(candidate_dir)
+            names = {image.name for image in current.images.values()}
+            other_names = {image.name for image in other.images.values()}
+            if len(names & other_names) < 3 or not other_names - names:
+                continue
+            merged_dir = os.path.join(colmap_dir, "component_merges", str(index))
+            os.makedirs(merged_dir, exist_ok=True)
+            try:
+                _run(["colmap", "model_merger", "--input_path1", model_dir,
+                      "--input_path2", candidate_dir, "--output_path", merged_dir,
+                      "--max_reproj_error", "4"], log_path, "model_merger")
+                merged = pycolmap.Reconstruction(merged_dir)
+            except (RuntimeError, ValueError):
+                # 无可靠几何对齐时保留当前模型，后续仍需通过注册率验收。
+                continue
+            if len(merged.images) > len(current.images):
+                current, model_dir = merged, merged_dir
+        if len(current.images) > registered:
+            refined_dir = os.path.join(colmap_dir, "merged_refined")
+            os.makedirs(refined_dir, exist_ok=True)
+            _run(["colmap", "bundle_adjuster", "--input_path", model_dir,
+                  "--output_path", refined_dir], log_path, "merged_bundle_adjustment")
+            model_dir = refined_dir
+            registered = len(pycolmap.Reconstruction(model_dir).images)
     status_cb("colmap", "component", 0.32, f"选择最大重建分量：{registered}/{n_images} 张")
 
     status_cb("colmap", "undistort", 0.35, "COLMAP 图像去畸变中")

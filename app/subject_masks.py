@@ -80,3 +80,13 @@ def weighted_l1(prediction, target, mask, foreground, background):
     # 先平均颜色通道，避免仅除以空间权重导致 RGB 损失错误放大三倍。
     error = (prediction - target).abs().mean(dim=0)
     return (error * weight).sum() / weight.sum().clamp_min(1e-12)
+
+
+def silhouette_loss(alpha, mask):
+    """前景与背景分别归一化，防止大面积背景压过主体的透明度监督。"""
+    if alpha.shape != mask.shape:
+        raise ValueError("透明度与主体掩码尺寸不匹配")
+    error = (alpha - mask).abs()
+    background = 1 - mask
+    return .5 * ((error * mask).sum() / mask.sum().clamp_min(1)
+                 + (error * background).sum() / background.sum().clamp_min(1))
