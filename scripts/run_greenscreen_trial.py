@@ -33,6 +33,7 @@ def prepare(source, task, status, reuse_task=None):
     task.mkdir(parents=True, exist_ok=False)
     shutil.copytree(source / "images", task / "images")
     shutil.copy2(source / "selection.json", task / "selection.json")
+    source_protocol = json.loads((source / "selection.json").read_text(encoding="utf-8"))
     (task / "sfm_masks").mkdir()
     (task / "foreground_original").mkdir()
     for name in names:
@@ -44,10 +45,18 @@ def prepare(source, task, status, reuse_task=None):
         Image.fromarray(inner).save(task / "sfm_masks" / (name + ".png"))
     (task / "input_mask_validation.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     if reuse_task is None:
-        dense = _run_colmap(str(task), len(names), status, {
+        feature_groups = []
+        for group in source_protocol.get("feature_groups", []):
+            list_path = task / Path(group["image_list"]).name
+            list_path.write_text((source / group["image_list"]).read_text(encoding="utf-8"), encoding="utf-8")
+            feature_groups.append({"image_list": str(list_path), "camera_params": group["camera_params"]})
+        colmap_options = {
             "camera_model": "SIMPLE_RADIAL", "matcher": "exhaustive", "init_min_tri_angle": 4,
             "max_image_size": 2000, "mask_path": str(task / "sfm_masks"), "merge_components": True,
-        })
+        }
+        if feature_groups:
+            colmap_options["feature_groups"] = feature_groups
+        dense = _run_colmap(str(task), len(names), status, colmap_options)
     else:
         # 复用同一批图已验证的相机，逐文件核对摘要，避免再次提取、匹配和重建。
         for name in names:

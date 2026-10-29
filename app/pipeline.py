@@ -85,7 +85,7 @@ def _run_colmap(task_dir: str, n_images: int, status_cb, options=None):
         "colmap", "feature_extractor",
         "--database_path", db,
         "--image_path", images_dir,
-        "--ImageReader.single_camera", "1",
+        "--ImageReader.single_camera", "0" if options.get("feature_groups") else "1",
         "--ImageReader.camera_model", options.get("camera_model", "OPENCV"),
         "--SiftExtraction.use_gpu", use_gpu,
     ]
@@ -95,7 +95,15 @@ def _run_colmap(task_dir: str, n_images: int, status_cb, options=None):
         if not os.path.isdir(mask_path):
             raise ValueError("COLMAP 特征掩码目录不存在")
         feature_command.extend(["--ImageReader.mask_path", mask_path])
-    _run(feature_command, log_path, "feature_extractor")
+    groups = options.get("feature_groups")
+    if groups:
+        # 视频共用一组内参，补拍照片各自独立；裁切后主点随像素偏移同步平移。
+        for index, group in enumerate(groups):
+            command = feature_command + ["--image_list_path", group["image_list"],
+                "--ImageReader.camera_params", ",".join(str(value) for value in group["camera_params"])]
+            _run(command, log_path, f"feature_extractor_group_{index}")
+    else:
+        _run(feature_command, log_path, "feature_extractor")
 
     status_cb("colmap", "matcher", 0.15, "COLMAP 特征匹配中")
     matcher = options.get("matcher", "auto")

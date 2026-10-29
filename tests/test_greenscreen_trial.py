@@ -11,9 +11,19 @@ import torch
 
 from app.evaluation import evaluate_views
 from scripts.prepare_greenscreen_video import can_mask
+from scripts.prepare_red_can_capture import red_can_mask
 
 
 class GreenScreenTests(unittest.TestCase):
+    def test_red_can_mask_rejects_green_cloth_and_keeps_red_body(self):
+        rgb = np.full((360, 540, 3), (80, 220, 90), dtype=np.uint8)
+        cv2.rectangle(rgb, (180, 95), (360, 285), (232, 30, 35), -1)
+        cv2.ellipse(rgb, (270, 95), (90, 35), 0, 0, 360, (210, 190, 145), -1)
+        mask = red_can_mask(rgb)
+        self.assertEqual(mask[180, 270], 255)
+        self.assertEqual(mask[40, 270], 0)
+        self.assertEqual(mask[320, 270], 0)
+
     def test_keep_green_lid_artwork_but_reject_bright_green_backdrop(self):
         rgb = np.full((480, 720, 3), (90, 220, 80), dtype=np.uint8)
         rgb[170:400, 245:277] = (195, 249, 188)
