@@ -6,6 +6,13 @@ import os
 import numpy as np
 
 
+def normalize_camera_translations(camtoworlds, center, scale):
+    """世界尺度变化只作用于相机中心，旋转必须仍是正交矩阵。"""
+    result = camtoworlds.copy()
+    result[:, :3, 3] = (result[:, :3, 3] - center) * scale
+    return result
+
+
 def camera_normalization(positions, dataset_dir):
     """严格留出协议可固定训练相机的归一化，防止验证相机影响坐标尺度。"""
     manifest = os.path.join(dataset_dir, "scene_normalization.json")

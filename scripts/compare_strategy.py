@@ -14,6 +14,10 @@ def main():
     parser.add_argument("output_dir")
     parser.add_argument("--strategy", choices=("default", "mcmc"), default="default")
     parser.add_argument("--iterations", type=int)
+    parser.add_argument("--rigid-normalization", action="store_true", help="仅缩放相机中心，需新建同约定基线")
+    parser.add_argument("--sparse-depth", action="store_true", help="启用可靠观测的逆深度监督")
+    parser.add_argument("--sparse-depth-weight", type=float, default=.01)
+    parser.add_argument("--bilateral-grid", action="store_true", help="启用训练视角局部仿射光度补偿")
     parser.add_argument("--audit-trace", action="store_true", help="额外保存真实初始化和抽样序列，用于隔离复现诊断")
     parser.add_argument("--refine-stop", type=int, help="固定增密停止步号，其余训练时程保持原样")
     parser.add_argument("--checkpoint-every", type=int, default=0)
@@ -32,6 +36,8 @@ def main():
     config = json.loads((root / "training_config.json").read_text(encoding="utf-8"))
     runtime = json.loads((root / "effective_config.json").read_text(encoding="utf-8"))
     options = dict(config["training"], strategy=args.strategy)
+    options.update(sparse_depth=args.sparse_depth, sparse_depth_weight=args.sparse_depth_weight,
+                   bilateral_grid=args.bilateral_grid, rigid_normalization=args.rigid_normalization)
     if args.audit_trace:
         options["audit_trace"] = True
     iterations = args.iterations or runtime["iterations"]

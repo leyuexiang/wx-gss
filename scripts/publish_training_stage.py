@@ -59,7 +59,8 @@ def main():
     point_count = export_gaussians(params, str(output), auto_cleanup=denoise.get("enable", True),
                                    cleanup_threshold=denoise.get("opacity_threshold", .005), denoise_config=denoise)
     del params
-    scene = ColmapScene(str(task / "dataset"), actual["downsample"])
+    scene = ColmapScene(str(task / "dataset"), actual["downsample"],
+                        rigid_normalization=actual["training"].get("rigid_normalization", False))
     dataset = ColmapDataset(scene, cache_bytes=64 * 1024**2, uint8_images=True)
     delivered = load_ply_params(str(output / "point_cloud.ply"))
     metrics = evaluate_views(delivered, dataset, str(output / "evaluation/validation"),

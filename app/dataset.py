@@ -47,7 +47,7 @@ def _image_w2c(img) -> np.ndarray:
 
 
 class ColmapScene:
-    def __init__(self, dataset_dir: str, factor: int):
+    def __init__(self, dataset_dir: str, factor: int, sparse_depth=False, rigid_normalization=False):
         import pycolmap
 
         rec = pycolmap.Reconstruction(os.path.join(dataset_dir, "sparse", "0"))
@@ -93,7 +93,12 @@ class ColmapScene:
         S = np.eye(4) * scene_scale
         S[3, 3] = 1.0
         transform = S @ T
-        camtoworlds = transform[None] @ camtoworlds
+        if rigid_normalization:
+            from app.camera_geometry import normalize_camera_translations
+            camtoworlds = normalize_camera_translations(camtoworlds, center, scene_scale)
+        else:
+            # 历史模型保留原坐标约定，新深度实验显式使用刚性相机归一化。
+            camtoworlds = transform[None] @ camtoworlds
 
         pts, cols = [], []
         for _, p in rec.points3D.items():
@@ -111,6 +116,24 @@ class ColmapScene:
         self.points_rgb = points_rgb.astype(np.float32)
         self.scene_scale = 1.0  # 已归一化到单位尺度
         self.n_images = len(names)
+        self.sparse_observations = None
+        if sparse_depth:
+            from app.sparse_depth import project_depth
+            self.sparse_observations = []
+            # 只使用实际观测轨迹，避免把被遮挡点投影为监督；阈值固定并在报告披露。
+            for index, (_, image) in enumerate(sorted(rec.images.items())):
+                reliable = []
+                for observation in image.points2D:
+                    if not observation.has_point3D():
+                        continue
+                    point = rec.points3D[observation.point3D_id]
+                    if point.track.length() >= 3 and np.isfinite(point.error) and point.error <= 2.0:
+                        reliable.append(point.xyz)
+                world = np.asarray(reliable, dtype=np.float64).reshape(-1, 3)
+                world = world @ transform[:3, :3].T + transform[:3, 3]
+                size = dimensions[index]
+                self.sparse_observations.append(project_depth(world, self.camtoworlds[index],
+                    self.Ks[index], size["width"], size["height"]))
 
 
 class ColmapDataset(Dataset):
@@ -153,6 +176,10 @@ class ColmapDataset(Dataset):
             "K": torch.from_numpy(self.scene.Ks[idx]),
             "image_id": idx,
         }
+        if getattr(self.scene, "sparse_observations", None) is not None:
+            xy, depths = self.scene.sparse_observations[idx]
+            data["sparse_xy"] = torch.from_numpy(xy)
+            data["sparse_depth"] = torch.from_numpy(depths)
 
         if self.mask_dir:
             # 掩码只作为可选实验输入；缺少任一帧时直接失败，避免静默退回无掩码训练。

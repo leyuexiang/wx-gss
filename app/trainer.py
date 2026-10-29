@@ -121,7 +121,18 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
 
     enable_antialiasing = denoise_config.get('antialiasing', True)
 
-    scene = ColmapScene(dataset_dir, factor=downsample)
+    sparse_enabled = options.get("sparse_depth", False)
+    bilateral_enabled = options.get("bilateral_grid", False)
+    sparse_weight = options.get("sparse_depth_weight", .01)
+    if not math.isfinite(sparse_weight) or not 0 < sparse_weight <= 1:
+        raise ValueError("稀疏深度权重必须在 (0, 1] 内")
+    if sparse_enabled and (enable_depth_reg or enable_pose_opt):
+        raise ValueError("稀疏深度实验暂不与稠密深度或位姿微调混用")
+    rigid_normalization = options.get("rigid_normalization", False)
+    if sparse_enabled and not rigid_normalization:
+        raise ValueError("稀疏深度实验必须显式启用刚性相机归一化，并重建同约定基线")
+    scene = ColmapScene(dataset_dir, factor=downsample, sparse_depth=sparse_enabled,
+                        rigid_normalization=rigid_normalization)
     cache_bytes = options.get("image_cache_mb", 256) * 1024**2
     mask_dir = options.get("mask_dir")
     allow_unreviewed_masks = options.get("allow_unreviewed_masks", False)
@@ -185,6 +196,19 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
     train_indices = [index for index in range(n_images) if index not in validation_set]
     if len(train_indices) < 2:
         raise ValueError("留出验证视角后至少需要两张训练图像")
+    bilateral = None
+    if bilateral_enabled:
+        from app.bilateral_grid import BilateralGrid
+        bilateral = BilateralGrid(n_images).to(device)
+        bilateral_optimizer = torch.optim.Adam(bilateral.parameters(), lr=.002)
+    if sparse_enabled:
+        from app.sparse_depth import inverse_depth_loss
+        coverage = {scene.names[i]: len(scene.sparse_observations[i][1]) for i in range(n_images)}
+        if not any(coverage[scene.names[i]] for i in train_indices):
+            raise ValueError("训练集没有可靠稀疏深度观测")
+        with open(os.path.join(out_dir, "sparse_depth_report.json"), "w", encoding="utf-8") as output:
+            json.dump({"counts": coverage, "min_track_length": 3, "max_reprojection_error": 2.,
+                       "depth_kind": "normalized_camera_z", "supervised_indices": train_indices}, output, indent=2)
     effective = {
         "iterations": iterations, "downsample": downsample, "cap_max": cap_max,
         "training": {**options, "strategy": strategy_name, "seed": seed, "sh_degree": sh_degree,
@@ -202,6 +226,9 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         "train_indices": train_indices, "validation_indices": validation_indices,
         "validation_scope": options.get("validation_scope", "仅留出颜色监督；相机重建和初始点云可能使用全部输入，不能称为完全未见视角"),
         "strategy_implementation": type(strategy).__name__,
+        "sparse_depth": {"enabled": sparse_enabled, "weight": sparse_weight},
+        "bilateral_grid": {"enabled": bilateral_enabled, "shape": [8, 8, 4], "tv_weight": 10.,
+                           "lr": .002, "evaluation": "不使用验证图拟合校色；评估未经网格处理的高斯模型"},
     }
     with open(os.path.join(out_dir, "effective_config.json"), "w", encoding="utf-8") as output:
         json.dump(effective, output, ensure_ascii=False, indent=2)
@@ -257,7 +284,7 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         colors = torch.cat([params["sh0"], params["shN"]], dim=1)
 
         # 启用深度渲染（如果需要深度正则化）
-        render_mode = "RGB+ED" if (has_depth and "depth" in data) else "RGB"
+        render_mode = "RGB+ED" if sparse_enabled or (has_depth and "depth" in data) else "RGB"
 
         renders, _, info = rasterization(
             means=params["means"],
@@ -294,6 +321,9 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
             pred_rgb = rendered.permute(2, 0, 1)            # [3, H, W]
             rendered_depth = None
 
+        # 光度补偿仅作用于训练颜色损失，深度保持原渲染值。
+        if bilateral is not None:
+            pred_rgb = bilateral(pred_rgb, data["image_id"])
         if mask_dir:
             mask = data["mask"].to(device=device, dtype=torch.float32).div_(255.0)
             # 归一化后的权重强调主体，但保持原图作为监督，不把背景涂成黑色。
@@ -328,7 +358,15 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
 
         # 总loss
         loss = photo_loss + depth_weight * depth_loss_val + pose_reg_loss_val + smoothness_loss_val
+        if sparse_enabled:
+            loss = loss + sparse_weight * inverse_depth_loss(rendered_depth,
+                data["sparse_xy"].to(device), data["sparse_depth"].to(device))
+        if bilateral is not None:
+            loss = loss + 10 * bilateral.smoothness(data["image_id"])
         loss.backward()
+        if bilateral is not None:
+            bilateral_optimizer.step()
+            bilateral_optimizer.zero_grad(set_to_none=True)
         last_loss = loss.item()
 
         # 梯度裁剪（去噪配置）
@@ -380,6 +418,9 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
 
     if audit is not None:
         audit.save()
+    if bilateral is not None:
+        # 网格是独立外观参数，不将其伪装为标准 PLY 的一部分。
+        torch.save(bilateral.state_dict(), os.path.join(out_dir, "bilateral_grid.pt"))
     num_gs = params["means"].shape[0]
     mem_gb = torch.cuda.max_memory_allocated() / 2**30
 

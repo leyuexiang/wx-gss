@@ -16,6 +16,7 @@ def main():
     parser.add_argument("annotations")
     parser.add_argument("output_dir")
     parser.add_argument("--factor", type=int, default=1)
+    parser.add_argument("--rigid-normalization", action="store_true", help="与新实验保持相同刚性相机约定，不能混用于历史模型")
     parser.add_argument("--split", default="heldout_rgb_supervision")
     parser.add_argument("--include-background", action="store_true",
                         help="同一次渲染输出全图、冻结主体矩形及矩形外背景误差")
@@ -23,7 +24,8 @@ def main():
     from app.dataset import ColmapScene, ColmapDataset
     from app.evaluation import load_ply_params, evaluate_views
     annotations = json.loads(Path(args.annotations).read_text(encoding="utf-8"))
-    dataset = ColmapDataset(ColmapScene(args.dataset_dir, args.factor))
+    dataset = ColmapDataset(ColmapScene(args.dataset_dir, args.factor,
+                                      rigid_normalization=args.rigid_normalization))
     by_name = {name: index for index, name in enumerate(dataset.scene.names)}
     unknown = set(annotations["frames"]) - set(by_name)
     if unknown:
