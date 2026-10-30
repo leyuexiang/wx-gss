@@ -74,6 +74,8 @@
 
 因此本轮只接受“盖顶修正路线值得继续”的结论，不升级默认分割、不发布为新推荐。下一步先核验薄金属底圈的实际像素边界及候选覆盖，纠正可能的误删后，再做完整预算和重复训练。30 帧形状先验、自动参考、非独立几何留出等限制仍保留。
 
+后续放大核验已确认部分底圈被裁去；局部亮带恢复仍无法可靠分离桌面反光，未启用训练，详见 [金属底圈核验记录](3DGS金属底圈核验记录.md)。
+
 - [全部验证视角对照](../data/quality-audits/cap-outline-paired-1000-20261030/validation-contact.jpg)：候选参考、当前掩码模型、顶底候选模型。
 - [邻域平移探针对照](../data/quality-audits/cap-outline-paired-1000-20261030/shifted-camera-contact.jpg)：左为当前掩码模型，右为候选模型。
 - [区域诊断](../data/quality-audits/cap-outline-paired-1000-20261030/outline_regions.json)、[完整结果](../data/quality-audits/cap-outline-paired-1000-20261030/comparison.json)、[配对核对](../data/quality-audits/cap-outline-paired-1000-20261030/pair_verification.json) 均保存于忽略的数据目录，不随代码推送。

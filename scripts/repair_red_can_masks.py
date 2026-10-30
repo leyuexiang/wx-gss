@@ -21,8 +21,11 @@ def main():
     parser.add_argument("source")
     parser.add_argument("output")
     parser.add_argument("--edge-guided", action="store_true", help="使用圆罐边缘候选；记录几何先验，尚非通用分割")
+    parser.add_argument("--preserve-base-band", action="store_true", help="只恢复已有轮廓底边相连的有限金属亮带")
     args = parser.parse_args()
     source, output = Path(args.source), Path(args.output)
+    if args.preserve_base_band and not args.edge_guided:
+        parser.error('底圈亮带恢复仅允许与边缘候选一起使用')
     output.mkdir(parents=True, exist_ok=False)
     shutil.copytree(source / "images", output / "images")
     masks = output / "feature_masks"
@@ -41,6 +44,10 @@ def main():
             if args.edge_guided:
                 from app.foreground.priors.cylinder_edges import cylinder_edge_mask
                 mask, edge_report = cylinder_edge_mask(small)
+                if args.preserve_base_band:
+                    from app.foreground.priors.base_band import preserve_base_band
+                    mask, band_report = preserve_base_band(small, mask)
+                    edge_report['base_band'] = band_report
             else:
                 mask = provider.segment(small)
             # 向内收缩后的粗轮廓用于发现半主体截断；只是专用先验，不冒充人工复查。
@@ -75,6 +82,8 @@ def main():
         manifest["provider"]["video"] = {"name": "red_can_edge_guided", "version": 1,
             "kind": "geometry_color_prior", "reviewed": False,
             "scope": "固定拍摄圆罐边缘候选；异常上沿使用截面先验"}
+        if args.preserve_base_band:
+            manifest['provider']['video'].update(version=2, base_band_recovery=True)
     manifest["quality"] = {"passed": all(row["new"]["passed"] for row in report),
         "scope": "仅检查专用先验覆盖，不证明背景干净或标注准确", "support_report": "support_report.json"}
     if args.edge_guided:
