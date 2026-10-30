@@ -124,12 +124,19 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
     sparse_enabled = options.get("sparse_depth", False)
     bilateral_enabled = options.get("bilateral_grid", False)
     sparse_weight = options.get("sparse_depth_weight", .01)
+    observation_dir = options.get("depth_observation_dir")
+    observation_weight = options.get("depth_observation_weight", .005)
+    if observation_dir and (isinstance(observation_weight, bool) or not isinstance(observation_weight, (int, float))
+                            or not math.isfinite(observation_weight) or not 0 < observation_weight <= .1):
+        raise ValueError("外部深度权重必须在 (0, 0.1] 内")
+    if observation_dir and (sparse_enabled or enable_depth_reg or enable_pose_opt):
+        raise ValueError("外部深度观测不能与其他深度分支或位姿微调混用")
     if not math.isfinite(sparse_weight) or not 0 < sparse_weight <= 1:
         raise ValueError("稀疏深度权重必须在 (0, 1] 内")
     if sparse_enabled and (enable_depth_reg or enable_pose_opt):
         raise ValueError("稀疏深度实验暂不与稠密深度或位姿微调混用")
     rigid_normalization = options.get("rigid_normalization", False)
-    if sparse_enabled and not rigid_normalization:
+    if (sparse_enabled or observation_dir) and not rigid_normalization:
         raise ValueError("稀疏深度实验必须显式启用刚性相机归一化，并重建同约定基线")
     scene = ColmapScene(dataset_dir, factor=downsample, sparse_depth=sparse_enabled,
                         rigid_normalization=rigid_normalization)
@@ -217,6 +224,15 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         with open(os.path.join(out_dir, "sparse_depth_report.json"), "w", encoding="utf-8") as output:
             json.dump({"counts": coverage, "min_track_length": 3, "max_reprojection_error": 2.,
                        "depth_kind": "normalized_camera_z", "supervised_indices": train_indices}, output, indent=2)
+    observations, observation_report = {}, None
+    if observation_dir:
+        from app.depth_observations import load_depth_observations
+        from app.sparse_depth import inverse_depth_loss
+        loaded, observation_report = load_depth_observations(observation_dir, scene, train_indices, dataset)
+        # 在训练前一次传入显卡；不在每次采样时解压观测或创建相同张量。
+        observations = {i: (torch.from_numpy(xy).to(device), torch.from_numpy(z).to(device))
+                        for i, (xy, z) in loaded.items()}
+    observation_history = {'steps': 0, 'loss_sum': 0., 'loss_max': 0., 'by_view': {}}
     effective = {
         "iterations": iterations, "downsample": downsample, "cap_max": cap_max,
         "training": {**options, "strategy": strategy_name, "seed": seed, "sh_degree": sh_degree,
@@ -237,6 +253,8 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         "validation_scope": options.get("validation_scope", "仅留出颜色监督；相机重建和初始点云可能使用全部输入，不能称为完全未见视角"),
         "strategy_implementation": type(strategy).__name__,
         "sparse_depth": {"enabled": sparse_enabled, "weight": sparse_weight},
+        "depth_observations": {"enabled": bool(observation_dir), "weight": observation_weight,
+                               "report": observation_report},
         "bilateral_grid": {"enabled": bilateral_enabled, "shape": [8, 8, 4], "tv_weight": 10.,
                            "lr": .002, "evaluation": "不使用验证图拟合校色；评估未经网格处理的高斯模型"},
     }
@@ -294,7 +312,8 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         colors = torch.cat([params["sh0"], params["shN"]], dim=1)
 
         # 启用深度渲染（如果需要深度正则化）
-        render_mode = "RGB+ED" if sparse_enabled or (has_depth and "depth" in data) else "RGB"
+        render_mode = "RGB+ED" if (sparse_enabled or observation_dir or options.get("diagnostic_depth_render", False)
+                                   or (has_depth and "depth" in data)) else "RGB"
 
         renders, alphas, info = rasterization(
             means=params["means"],
@@ -374,6 +393,18 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
         if sparse_enabled:
             loss = loss + sparse_weight * inverse_depth_loss(rendered_depth,
                 data["sparse_xy"].to(device), data["sparse_depth"].to(device))
+        if sampled_index in observations:
+            xy, z = observations[sampled_index]
+            observed_loss = inverse_depth_loss(rendered_depth, xy, z)
+            if not torch.isfinite(observed_loss):
+                raise ValueError("外部深度损失非有限，停止本轮实验")
+            loss = loss + observation_weight * observed_loss
+            value = float(observed_loss.detach())
+            observation_history['steps'] += 1
+            observation_history['loss_sum'] += value
+            observation_history['loss_max'] = max(observation_history['loss_max'], value)
+            name = scene.names[sampled_index]
+            observation_history['by_view'][name] = observation_history['by_view'].get(name, 0) + 1
         if bilateral is not None:
             loss = loss + 10 * bilateral.smoothness(data["image_id"])
         loss.backward()
@@ -431,6 +462,12 @@ def train(dataset_dir: str, out_dir: str, iterations: int, downsample: int,
 
     if audit is not None:
         audit.save()
+    if observation_dir:
+        if not observation_history['steps']:
+            raise ValueError("本轮未实际采样任何外部深度视角")
+        observation_history['mean_loss'] = observation_history['loss_sum'] / observation_history['steps']
+        with open(os.path.join(out_dir, 'depth_observation_usage.json'), 'w', encoding='utf-8') as output:
+            json.dump(observation_history, output, ensure_ascii=False, indent=2)
     if bilateral is not None:
         # 网格是独立外观参数，不将其伪装为标准 PLY 的一部分。
         torch.save(bilateral.state_dict(), os.path.join(out_dir, "bilateral_grid.pt"))

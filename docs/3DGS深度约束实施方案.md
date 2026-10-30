@@ -118,5 +118,7 @@ python3 scripts/probe_depth_alignment.py \
 
 ## 依据
 
+后续 D2 的可信区域与三组短训练执行情况，见 [深度可信区域短训练记录](3DGS深度可信区域短训练记录.md)。本页 D1 中的“尚未训练”描述对应当时诊断批次；D2 使用独立目录及默认关闭的实验入口。
+
 - [原版 3DGS：深度正则化](https://github.com/graphdeco-inria/gaussian-splatting#depth-regularization)：已集成深度约束，同时说明不同场景可能改善、变化很小或变差。
 - [Depth Anything V2 官方项目](https://github.com/DepthAnything/Depth-Anything-V2)：提供相对深度模型及独立的度量深度模型，接入时需要明确使用的输出表示。
