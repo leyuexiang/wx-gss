@@ -18,24 +18,27 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('task')
     parser.add_argument('trial')
+    parser.add_argument('--groups', nargs='+', default=['none', 'sparse', 'dense'], help='按相同参考评估的实验组目录')
+    parser.add_argument('--evaluation-subdir', default='evaluation/validation', help='各组的共同参考评估目录')
     args = parser.parse_args()
     from app.dataset import ColmapScene
     from app.evaluation import load_ply_params
     from gsplat import rasterization
     task, trial = Path(args.task), Path(args.trial)
     scene = ColmapScene(str(task / 'dataset'), 1, rigid_normalization=True)
-    kinds = ('none', 'sparse', 'dense')
-    metrics = json.loads((trial / 'none/evaluation/validation/metrics.json').read_text(encoding='utf-8'))
+    kinds = tuple(args.groups)
+    evaluation = Path(args.evaluation_subdir)
+    metrics = json.loads((trial / kinds[0] / evaluation / 'metrics.json').read_text(encoding='utf-8'))
     records = metrics['records']
     # 完整联系表保留全部验证图，避免仅挑选看起来改善的方向。
-    canvas = Image.new('RGB', (4 * 200, len(records) * 270), (20, 20, 20))
+    canvas = Image.new('RGB', ((len(kinds) + 1) * 200, len(records) * 270), (20, 20, 20))
     draw = ImageDraw.Draw(canvas)
     for row, record in enumerate(records):
         width, height = record['width'], record['height']
         filename = f"view_{record['index']:04d}.png"
         for col, label in enumerate(('reference',) + kinds):
-            kind = 'none' if col == 0 else label
-            with Image.open(trial / kind / 'evaluation/validation' / filename) as panels:
+            kind = kinds[0] if col == 0 else label
+            with Image.open(trial / kind / evaluation / filename) as panels:
                 left = 0 if col == 0 else width
                 tile = panels.crop((left, 24, left + width, 24 + height)).resize((200, 245), Image.Resampling.LANCZOS)
             canvas.paste(tile, (col * 200, row * 270 + 25))
@@ -72,7 +75,7 @@ def main():
             renders[kind].append(image)
         del params, colors
         torch.cuda.empty_cache()
-    canvas = Image.new('RGB', (3 * 240, len(camera_records) * 320), (20, 20, 20))
+    canvas = Image.new('RGB', (len(kinds) * 240, len(camera_records) * 320), (20, 20, 20))
     draw = ImageDraw.Draw(canvas)
     for row, record in enumerate(camera_records):
         for col, kind in enumerate(kinds):

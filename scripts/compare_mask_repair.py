@@ -34,6 +34,8 @@ def main():
     parser.add_argument("repaired_source")
     parser.add_argument("output")
     parser.add_argument("--iterations", type=int, default=1000)
+    parser.add_argument("--baseline-masks", help="指定当前对照掩码，默认沿用共享任务历史掩码")
+    parser.add_argument("--outline-review", help="边缘几何候选的完整目视检查记录，不等同人工真值")
     args = parser.parse_args()
     if not 600 <= args.iterations <= 7000:
         parser.error("训练次数应在 600–7000 范围内")
@@ -49,6 +51,17 @@ def main():
     source_manifest = json.loads((source / "feature_masks/mask_manifest.json").read_text())
     if not source_manifest.get("quality", {}).get("passed"):
         raise ValueError("修正掩码的前景覆盖检查必须通过")
+    outline_review = None
+    if source_manifest.get('provider', {}).get('video', {}).get('kind') == 'geometry_color_prior':
+        if not args.outline_review:
+            raise ValueError('几何轮廓候选必须提供完整目视检查记录，不能仅靠罐身覆盖门禁')
+        from app.foreground.review import validate_outline_review
+        outline_review = validate_outline_review(source, args.outline_review)
+    baseline_masks = Path(args.baseline_masks) if args.baseline_masks else task / 'subject_masks'
+    for name, entry in source_manifest['frames'].items():
+        if (entry['image_sha256'] != file_digest(task / 'images' / name)
+                or entry['mask_sha256'] != file_digest(source / 'feature_masks' / entry['mask'])):
+            raise ValueError('候选掩码与共享几何的原始图像来源不一致')
     output.mkdir(parents=True, exist_ok=False)
     originals = output / "original_masks"
     originals.mkdir()
@@ -90,12 +103,20 @@ def main():
     options.update(training_names=train_names, validation_names=val_names, validation_every=0,
         foreground_only=True, rigid_normalization=True, allow_unreviewed_masks=True,
         refine_stop_ratio=.8, audit_trace=True, checkpoint_every=0)
+    source_root = Path(__file__).resolve().parents[1]
+    source_files = ('app/trainer.py', 'app/dataset.py', 'app/evaluation.py',
+                    'app/foreground/review.py', 'scripts/compare_mask_repair.py')
+    source_hashes = {name: file_digest(source_root / name) for name in source_files}
     write_json_atomic(output / "protocol.json", {"iterations": args.iterations,
         "shared_task": str(task), "baseline_names_source": str(baseline), "training_names": train_names,
         "validation_names": val_names, "training_options": options,
-        "scope": "同几何同图同监督集合的掩码对照；验证参考统一为修正后的自动掩码，非人工真值；短训练不发布"})
+        "baseline_masks": str(baseline_masks), "outline_review": outline_review,
+        "baseline_manifest_sha256": file_digest(baseline_masks / 'mask_manifest.json'),
+        "candidate_manifest_sha256": file_digest(source / 'feature_masks/mask_manifest.json'),
+        "source_sha256": source_hashes,
+        "scope": "同几何同图同监督集合的掩码对照；验证参考统一为候选自动掩码，非人工真值；短训练不发布"})
     records = []
-    for label, mask_dir in (("old_mask", task / "subject_masks"), ("repaired_mask", masks)):
+    for label, mask_dir in (("old_mask", baseline_masks), ("repaired_mask", masks)):
         destination = output / label
         destination.mkdir()
         actual_options = dict(options, mask_dir=str(mask_dir))
@@ -115,6 +136,8 @@ def main():
         write_json_atomic(output / "comparison.json", records)
         print(json.dumps(record), flush=True)
     print(json.dumps(verify_pair(output)), flush=True)
+    if any(file_digest(source_root / name) != sha for name, sha in source_hashes.items()):
+        raise ValueError('掩码对照训练期间活动源码发生变化')
 
 
 if __name__ == "__main__":
